@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/distributed_runtime/eager/remote_tensor_handle_data.h"
 
-#include "tensorflow/core/distributed_runtime/eager/remote_execute_node.h"
+#include "tensorflow/core/distributed_runtime/eager/destroy_tensor_handle_node.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/gtl/cleanup.h"
 #include "tensorflow/core/lib/strings/strcat.h"
@@ -45,9 +45,8 @@ void DestoryRemoteTensorHandle(EagerContext* ctx,
 
   if (ctx->Async()) {
     tensorflow::uint64 id = ctx->NextId();
-    auto* node =
-        new eager::RemoteExecuteNode(id, std::move(request), eager_client);
-    ctx->ExecutorAdd(node);
+    ctx->ExecutorAdd(absl::make_unique<eager::DestroyTensorHandleNode>(
+        id, std::move(request), eager_client));
   } else {
     eager::EnqueueRequest* actual_request = request.release();
     eager::EnqueueResponse* response = new eager::EnqueueResponse;

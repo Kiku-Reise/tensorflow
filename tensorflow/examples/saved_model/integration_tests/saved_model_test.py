@@ -64,23 +64,33 @@ class SavedModelTest(scripts.TestCase, parameterized.TestCase):
         "use_model_in_sequential_keras", model_dir=export_dir)
 
   def test_text_embedding_in_dataset(self):
-    if tf.test.is_gpu_available():
-      self.skipTest("b/132156097 - fails if there is a gpu available")
-
     export_dir = self.get_temp_dir()
     self.assertCommandSucceeded(
         "export_simple_text_embedding", export_dir=export_dir)
     self.assertCommandSucceeded(
         "use_text_embedding_in_dataset", model_dir=export_dir)
 
-  @combinations.generate(
-      combinations.combine(
-          named_strategy=list(ds_utils.named_strategies.values()),
-          retrain_flag_value=["true", "false"],
-          regularization_loss_multiplier=[0, 2]),
+  TEST_MNIST_CNN_GENERATE_KWARGS = dict(
+      combinations=(
+          combinations.combine(
+              # Test all combinations with tf.saved_model.save().
+              use_keras_save_api=False,
+              named_strategy=list(ds_utils.named_strategies.values()),
+              retrain_flag_value=["true", "false"],
+              regularization_loss_multiplier=[None, 2],  # Test for b/134528831.
+          ) + combinations.combine(
+              # Test few critcial combinations with tf.keras.models.save_model()
+              # which is merely a thin wrapper (as of June 2019).
+              use_keras_save_api=True,
+              named_strategy=None,
+              retrain_flag_value="true",
+              regularization_loss_multiplier=[None, 2],  # Test for b/134528831.
+          )),
       test_combinations=[combinations.NamedGPUCombination()])
-  def test_mnist_cnn(self, named_strategy, retrain_flag_value,
-                     regularization_loss_multiplier):
+
+  @combinations.generate(**TEST_MNIST_CNN_GENERATE_KWARGS)
+  def test_mnist_cnn(self, use_keras_save_api, named_strategy,
+                     retrain_flag_value, regularization_loss_multiplier):
 
     self.skipIfMissingExtraDeps()
 
@@ -99,14 +109,18 @@ class SavedModelTest(scripts.TestCase, parameterized.TestCase):
         fast_test_mode=fast_test_mode,
         export_dir=feature_extrator_dir)
 
-    self.assertCommandSucceeded(
-        "use_mnist_cnn",
-        fast_test_mode=fast_test_mode,
-        input_saved_model_dir=feature_extrator_dir,
-        output_saved_model_dir=full_model_dir,
-        strategy=str(named_strategy),
-        retrain=retrain_flag_value,
-        regularization_loss_multiplier=regularization_loss_multiplier)
+    use_kwargs = dict(fast_test_mode=fast_test_mode,
+                      input_saved_model_dir=feature_extrator_dir,
+                      retrain=retrain_flag_value,
+                      use_keras_save_api=use_keras_save_api)
+    if full_model_dir is not None:
+      use_kwargs["output_saved_model_dir"] = full_model_dir
+    if named_strategy:
+      use_kwargs["strategy"] = str(named_strategy)
+    if regularization_loss_multiplier is not None:
+      use_kwargs[
+          "regularization_loss_multiplier"] = regularization_loss_multiplier
+    self.assertCommandSucceeded("use_mnist_cnn", **use_kwargs)
 
     if full_model_dir is not None:
       self.assertCommandSucceeded(

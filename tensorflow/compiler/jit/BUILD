@@ -1,6 +1,6 @@
 load("//tensorflow:tensorflow.bzl", "tf_cc_test", "cc_header_only_library")
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
-load("//tensorflow:tensorflow.bzl", "tf_custom_op_py_library")
+load("//tensorflow:tensorflow.bzl", "tf_custom_op_py_library", "tf_jit_compilation_passes_extra_deps")
 load("//tensorflow/core:platform/default/build_config.bzl", "tf_additional_all_protos", "tf_proto_library")
 
 package(
@@ -51,7 +51,6 @@ cc_library(
     deps = [
         ":jit_compilation_passes",
         "//tensorflow/compiler/jit/kernels:xla_ops",
-        "//tensorflow/compiler/tf2xla/kernels:xla_cpu_only_ops",
         "//tensorflow/compiler/tf2xla/kernels:xla_dummy_ops",
         "//tensorflow/compiler/tf2xla/kernels:xla_ops",
         "//tensorflow/compiler/xla/service:cpu_plugin",
@@ -198,7 +197,6 @@ cc_library(
         "//tensorflow/core/kernels:identity_op",
         "//tensorflow/core/kernels:resource_variable_ops",
         "//tensorflow/core/kernels:shape_ops",
-        "//tensorflow/core/kernels:stack",
         "//tensorflow/core/kernels:variable_ops",
         "//tensorflow/core/kernels/data:generator_dataset_op",
         "//tensorflow/core/kernels/data:iterator_ops",
@@ -318,9 +316,10 @@ cc_library(
     srcs = ["jit_compilation_pass_registration.cc"],
     deps = [
         ":compilation_passes",
+        ":xla_activity_logging_listener",
         "//tensorflow/compiler/tf2xla:functionalize_control_flow_pass_registration",
         "//tensorflow/core:core_cpu_internal",
-    ],
+    ] + tf_jit_compilation_passes_extra_deps(),
     alwayslink = 1,
 )
 
@@ -894,6 +893,17 @@ tf_proto_library(
     cc_api_version = 2,
     protodeps = tf_additional_all_protos(),
     provide_cc_alias = True,
+)
+
+cc_library(
+    name = "xla_activity_logging_listener",
+    srcs = ["xla_activity_logging_listener.cc"],
+    deps = [
+        ":xla_activity_listener",
+        "//tensorflow/core:logger",
+        "@com_google_absl//absl/memory",
+    ],
+    alwayslink = 1,
 )
 
 # This target can be used by XLA device plugins to prevent circular dependencies, and provides access to all of the required headers for building a device library.
