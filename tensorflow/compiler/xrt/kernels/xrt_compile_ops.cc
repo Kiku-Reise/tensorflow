@@ -49,8 +49,6 @@ namespace tensorflow {
 
 namespace {
 
-const int kDefaultCacheSize = 100;
-
 class XRTCompileOp : public OpKernel {
  public:
   explicit XRTCompileOp(OpKernelConstruction* ctx);
@@ -151,7 +149,7 @@ void XRTCompileOp::Compute(OpKernelContext* ctx) {
   xrt::XLAComputation computation_proto;
   OP_REQUIRES(
       ctx,
-      computation_proto.ParseFromString(computation_input.scalar<string>()()),
+      computation_proto.ParseFromString(computation_input.scalar<tstring>()()),
       errors::InvalidArgument(
           "Unable to parse computation input to XLAComputation"));
 
@@ -159,15 +157,9 @@ void XRTCompileOp::Compute(OpKernelContext* ctx) {
   OP_REQUIRES_OK(ctx, CompilationCacheKey(computation_proto, &key));
 
   // Process-wide cache of XLA executables.
-  XRTCompilationCache* cache;
-  OP_REQUIRES_OK(ctx,
-                 rm->LookupOrCreate<XRTCompilationCache>(
-                     rm->default_container(), kXRTCompilationCacheResourceName,
-                     &cache, [](XRTCompilationCache** new_cache) {
-                       *new_cache = new XRTCompilationCache(kDefaultCacheSize);
-                       return Status::OK();
-                     }));
-  core::ScopedUnref cache_unref(cache);
+  auto cache_or = GetOrCreateCompilationCache(rm, /*max_number_of_entries=*/0);
+  OP_REQUIRES_OK(ctx, cache_or.status());
+  auto cache = cache_or.ConsumeValueOrDie();
 
   int64 uid;
   OP_REQUIRES_OK(
@@ -191,7 +183,7 @@ void XRTCompileOp::Compute(OpKernelContext* ctx) {
                                              .ComputeProgramShape()
                                              .ToProto();
   Tensor program_shape_output(DT_STRING, TensorShape({1}));
-  program_shape_output.vec<string>()(0) = program_shape.SerializeAsString();
+  program_shape_output.vec<tstring>()(0) = program_shape.SerializeAsString();
   ctx->set_output(1, program_shape_output);
 }
 

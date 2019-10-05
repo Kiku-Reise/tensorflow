@@ -193,7 +193,8 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
     store->setAtomic(llvm::AtomicOrdering::Unordered);
     // Derive a minimum alignment from the type. The optimizer can increase it
     // later.
-    store->setAlignment(ShapeUtil::ByteSizeOfPrimitiveType(element_type));
+    store->setAlignment(
+        llvm::MaybeAlign(ShapeUtil::ByteSizeOfPrimitiveType(element_type)));
     return true;
   }
 
@@ -205,12 +206,12 @@ bool IrEmitter::MaybeEmitDirectAtomicOperation(
   }
 
   if (root_opcode == HloOpcode::kAdd) {
+    llvm::Triple target_triple = llvm::Triple(module_->getTargetTriple());
     // NVPTX supports atomicAdd on F32 and integer types.
-    if (element_type == F32) {
+    if (target_triple.isNVPTX() && element_type == F32) {
       // F32 + F32
-      llvm_ir::EmitCallToIntrinsic(llvm::Intrinsic::nvvm_atomic_load_add_f32,
-                                   {output_address, source},
-                                   {output_address->getType()}, &b_);
+      AtomicRMW(llvm::AtomicRMWInst::FAdd, output_address, source,
+                llvm::AtomicOrdering::SequentiallyConsistent);
       return true;
     }
     if (is_atomic_integral) {

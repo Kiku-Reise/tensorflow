@@ -18,8 +18,6 @@ $(MAKEFILE_DIR)/downloads/kissfft/kiss_fft.h \
 $(MAKEFILE_DIR)/downloads/kissfft/_kiss_fft_guts.h \
 $(MAKEFILE_DIR)/downloads/kissfft/tools/kiss_fftr.h
 
-KISSFFT_URL="https://github.com/mborgerding/kissfft/archive/v130.zip"
-KISSFFT_MD5="438ba1fef5783cc5f5f201395cc477ca"
 $(eval $(call add_third_party_download,$(KISSFFT_URL),$(KISSFFT_MD5),kissfft,patch_kissfft))
 
 THIRD_PARTY_CC_HDRS += \
@@ -104,6 +102,7 @@ MICRO_FEATURES_FFT_TEST_HDRS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/fft.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/fft_util.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/static_alloc.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/micro_model_settings.h \
 $(KISSFFT_LIB_HDRS)
 
 MICRO_FEATURES_FILTERBANK_TEST_SRCS := \
@@ -114,7 +113,12 @@ tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/filterba
 MICRO_FEATURES_FILTERBANK_TEST_HDRS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/filterbank.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/filterbank_util.h \
-tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/static_alloc.h
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/static_alloc.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/fft.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/fft_util.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/micro_model_settings.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/bits.h \
+$(KISSFFT_LIB_HDRS)
 
 MICRO_FEATURES_FRONTEND_TEST_SRCS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/frontend_test.cc \
@@ -123,6 +127,7 @@ $(MICRO_FEATURES_LIB_SRCS)
 MICRO_FEATURES_FRONTEND_TEST_HDRS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/frontend.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/frontend_util.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/micro_model_settings.h \
 $(MICRO_FEATURES_LIB_HDRS)
 
 MICRO_FEATURES_LOG_SCALE_TEST_SRCS := \
@@ -146,6 +151,7 @@ tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/noise_re
 MICRO_FEATURES_NOISE_REDUCTION_TEST_HDRS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/noise_reduction.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/noise_reduction_util.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/micro_model_settings.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/static_alloc.h
 
 MICRO_FEATURES_PCAN_GAIN_CONTROL_TEST_SRCS := \
@@ -156,6 +162,7 @@ tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/pcan_gai
 MICRO_FEATURES_PCAN_GAIN_CONTROL_TEST_HDRS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/pcan_gain_control.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/pcan_gain_control_util.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/bits.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/static_alloc.h
 
 MICRO_FEATURES_WINDOW_TEST_SRCS := \
@@ -166,6 +173,7 @@ tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/window_u
 MICRO_FEATURES_WINDOW_TEST_HDRS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/window.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/window_util.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/micro_model_settings.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/static_alloc.h
 
 MICRO_FEATURES_GENERATOR_SRCS := \
@@ -263,6 +271,7 @@ tensorflow/lite/experimental/micro/examples/micro_speech/command_responder.h
 
 MICRO_SPEECH_SRCS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/main.cc \
+tensorflow/lite/experimental/micro/examples/micro_speech/main_functions.cc \
 tensorflow/lite/experimental/micro/examples/micro_speech/audio_provider.cc \
 tensorflow/lite/experimental/micro/examples/micro_speech/feature_provider.cc \
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/no_micro_features_data.cc \
@@ -280,10 +289,12 @@ tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/yes_micr
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/tiny_conv_micro_features_model_data.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/recognize_commands.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/command_responder.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/main_functions.h \
 $(MICRO_FEATURES_GENERATOR_HDRS)
 
 MICRO_SPEECH_MOCK_SRCS := \
 tensorflow/lite/experimental/micro/examples/micro_speech/main.cc \
+tensorflow/lite/experimental/micro/examples/micro_speech/main_functions.cc \
 tensorflow/lite/experimental/micro/examples/micro_speech/audio_provider_mock.cc \
 tensorflow/lite/experimental/micro/examples/micro_speech/no_1000ms_sample_data.cc \
 tensorflow/lite/experimental/micro/examples/micro_speech/yes_1000ms_sample_data.cc \
@@ -306,6 +317,7 @@ tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/yes_micr
 tensorflow/lite/experimental/micro/examples/micro_speech/micro_features/tiny_conv_micro_features_model_data.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/recognize_commands.h \
 tensorflow/lite/experimental/micro/examples/micro_speech/command_responder.h \
+tensorflow/lite/experimental/micro/examples/micro_speech/main_functions.h \
 $(MICRO_FEATURES_GENERATOR_HDRS)
 
 # Find any platform-specific rules for this example.

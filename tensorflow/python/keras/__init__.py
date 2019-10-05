@@ -38,10 +38,10 @@ from tensorflow.python.keras import metrics
 from tensorflow.python.keras import models
 from tensorflow.python.keras import ops
 from tensorflow.python.keras import optimizers
+from tensorflow.python.keras import premade
 from tensorflow.python.keras import preprocessing
 from tensorflow.python.keras import regularizers
 from tensorflow.python.keras import utils
-from tensorflow.python.keras import wrappers
 from tensorflow.python.keras.layers import Input
 from tensorflow.python.keras.models import Model
 from tensorflow.python.keras.models import Sequential

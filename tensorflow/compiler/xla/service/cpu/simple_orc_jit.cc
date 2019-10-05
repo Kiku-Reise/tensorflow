@@ -62,6 +62,7 @@ llvm::SmallVector<std::string, 0> DetectMachineAttributes() {
   }
   return result;
 }
+
 }  // namespace
 
 /*static*/ std::unique_ptr<llvm::TargetMachine>
@@ -222,6 +223,7 @@ bool RegisterKnownJITSymbols() {
   REGISTER_CPU_RUNTIME_SYMBOL(EigenMatMulF16);
   REGISTER_CPU_RUNTIME_SYMBOL(EigenMatMulF32);
   REGISTER_CPU_RUNTIME_SYMBOL(EigenMatMulF64);
+  REGISTER_CPU_RUNTIME_SYMBOL(EigenMatMulS32);
   REGISTER_CPU_RUNTIME_SYMBOL(MKLMatMulF32);
   REGISTER_CPU_RUNTIME_SYMBOL(MKLMatMulF64);
   REGISTER_CPU_RUNTIME_SYMBOL(MKLSingleThreadedMatMulF32);
@@ -232,6 +234,7 @@ bool RegisterKnownJITSymbols() {
   REGISTER_CPU_RUNTIME_SYMBOL(EigenSingleThreadedMatMulF16);
   REGISTER_CPU_RUNTIME_SYMBOL(EigenSingleThreadedMatMulF32);
   REGISTER_CPU_RUNTIME_SYMBOL(EigenSingleThreadedMatMulF64);
+  REGISTER_CPU_RUNTIME_SYMBOL(EigenSingleThreadedMatMulS32);
   REGISTER_CPU_RUNTIME_SYMBOL(ParallelForkJoin);
   REGISTER_CPU_RUNTIME_SYMBOL(ReleaseInfeedBufferAfterDequeue);
   REGISTER_CPU_RUNTIME_SYMBOL(ReleaseOutfeedBufferAfterPopulation);

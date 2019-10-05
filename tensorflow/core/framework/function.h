@@ -18,6 +18,12 @@ limitations under the License.
 
 #include <vector>
 
+// clang-format off
+// Required for IS_MOBILE_PLATFORM
+#include "tensorflow/core/platform/platform.h"
+// clang-format on
+
+#include "absl/types/optional.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/attr_value_util.h"
 #include "tensorflow/core/framework/function.pb.h"
@@ -34,6 +40,9 @@ limitations under the License.
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/protobuf/config.pb.h"
+#if !defined(IS_MOBILE_PLATFORM)
+#include "tensorflow/core/protobuf/remote_tensor_handle.pb.h"
+#endif  // IS_MOBILE_PLATFORM
 
 namespace tensorflow {
 
@@ -442,20 +451,34 @@ class FunctionLibraryDefinition : public OpRegistryInterface {
   FunctionLibraryDefinition ReachableDefinitions(const GraphDef& graph) const;
   FunctionLibraryDefinition ReachableDefinitions(const FunctionDef& func) const;
 
+  // Copies the function named `func` from `other` to this
+  // FunctionLibraryDefinition.
+  // REQUIRES: `this->default_registry() == other.default_registry()`.
+  // Returns OK on success, or error otherwise. This is a no-op if a function
+  // name `func` already exists in this function library, and has the same
+  // implementation as in `other`. If the implementations conflict, an invalid
+  // argument error is returned.
+  Status CopyFunctionDefFrom(const string& func,
+                             const FunctionLibraryDefinition& other)
+      LOCKS_EXCLUDED(mu_);
+
  private:
   // Shape inference for functions is handled separately by ShapeRefiner.
 
   struct FunctionDefAndOpRegistration {
     explicit FunctionDefAndOpRegistration(const FunctionDef& fdef_in);
 
-    FunctionDef fdef;
-    OpRegistrationData op_registration_data;
+    const FunctionDef fdef;
+    const OpRegistrationData op_registration_data;
   };
 
-  const FunctionDef* FindHelper(const string& func) const
-      SHARED_LOCKS_REQUIRED(mu_);
+  std::shared_ptr<FunctionDefAndOpRegistration> FindHelper(
+      const string& func) const SHARED_LOCKS_REQUIRED(mu_);
   string FindGradientHelper(const string& func) const
       SHARED_LOCKS_REQUIRED(mu_);
+
+  Status AddHelper(std::shared_ptr<FunctionDefAndOpRegistration> registration,
+                   bool* added) EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // Same as AddFunctionDef/AddGradientDef except these methods set
   // `added` to true if the `fdef`/`grad` were actually added to this.
@@ -485,7 +508,7 @@ class FunctionLibraryDefinition : public OpRegistryInterface {
 
   mutable mutex mu_;
   const OpRegistryInterface* const default_registry_;
-  gtl::FlatMap<string, std::unique_ptr<FunctionDefAndOpRegistration>>
+  gtl::FlatMap<string, std::shared_ptr<FunctionDefAndOpRegistration>>
       function_defs_ GUARDED_BY(mu_);
   gtl::FlatMap<string, string> func_grad_ GUARDED_BY(mu_);
 };
@@ -522,24 +545,32 @@ class FunctionLibraryRuntime {
     std::vector<string> input_devices;
 
     // For multi-device functions, a vector of canonical device names for
-    // function's outputs. The device of resource outputs should be the CPU
-    // device, not the device backing the resource.
-    // If specified, must have the same length as the number of function
-    // outputs.
-    // If not specified, output devices are picked automatically. If operations
-    // producing the output tensors have explicit device specification, they
-    // will be respected. These device specifications must identify a unique
-    // device, i.e.  a general specification like "job:foo" matching multiple
-    // devices will result in an error.
-    std::vector<string> output_devices;
-
-    // This interface is EXPERIMENTAL and subject to change.
+    // function's outputs.
     //
-    // For multi-device functions, a mapping from _Arg node index to input
-    // tensor shape.
-    // REQUIRES: if input_tensor_shapes.count(i) > 0 then i-th argument type
-    // must not be DT_RESOURCE.
-    std::unordered_map<int, TensorShape> input_tensor_shapes;
+    // (a) If specified (must have the same length as number of outputs):
+    //
+    // Specified devices will be assigned to Retval nodes inserted into the
+    // function body graph in place of function outputs. It is allowed to
+    // specify output device as empty string, in this case Retval device
+    // assignment will be inferred later when function graph will be placed
+    // before partitioning (this is required for resource outputs). Placer will
+    // respect colocation constraints.
+    //
+    // (b) If not specified:
+    //
+    // Function runtime will infer Retval device by following input edges, until
+    // it will reach a node with a device specification. This device
+    // specification must identify a unique device, i.e. a general specification
+    // like "job:foo" matching multiple devices will result in an error.
+    //
+    // IMPORTANT: Resource outputs
+    //
+    // Multi device functions might return resources on a devices different from
+    // the function call device. If output device is not specified for the
+    // resource output, and node producing that resource is a function call,
+    // runtime will leave device specification empty and will rely on Placer to
+    // infer correct device.
+    std::vector<string> output_devices;
 
     // This interface is EXPERIMENTAL and subject to change.
     //
@@ -597,6 +628,15 @@ class FunctionLibraryRuntime {
     // If set, partitioned functions will be added to `graph_collector`.
     // `graph_collector` must be alive during the call to Instantiate.
     GraphCollector* graph_collector = nullptr;
+
+    // Indicates whether the multi-device function backend should default the
+    // placement of ops without request device to `target`.
+    bool default_device_to_target = true;
+
+    // If true, the optimized Graph will be stored so that
+    // `FunctionLibraryRuntime::DebugString(handle)` contains the optimized
+    // Graph. Otherwise, the unoptimized function Graph will be returned.
+    bool include_optimized_graph_in_debug_string = false;
   };
   typedef uint64 Handle;
   virtual Status Instantiate(const string& function_name, AttrSlice attrs,
@@ -604,7 +644,8 @@ class FunctionLibraryRuntime {
                              Handle* handle) = 0;
   Status Instantiate(const string& function_name, AttrSlice attrs,
                      Handle* handle) {
-    return Instantiate(function_name, attrs, {}, handle);
+    auto opts = absl::make_unique<InstantiateOptions>();
+    return Instantiate(function_name, attrs, *opts, handle);
   }
 
   // Releases state associated with the handle.
@@ -637,6 +678,12 @@ class FunctionLibraryRuntime {
     // MasterSession generates 56-bit random step IDs whose MSB is
     // always 0, so a negative random step ID should suffice.
     const int64 step_id = -std::abs(static_cast<int64>(random::New64()));
+
+    // op_id of the function running in eager mode. Set when we want to copy
+    // remote outputs lazily. All components of a remote multi-device function
+    // should use the same op_id, in order to correctly map remote output
+    // tensors to the remote TensorHandles in the default device.
+    absl::optional<int64> op_id = absl::nullopt;
 
     Rendezvous* rendezvous = nullptr;
     CancellationManager* cancellation_manager = nullptr;
@@ -709,6 +756,9 @@ class FunctionLibraryRuntime {
 
   // Returns the environment on which the function executes.
   virtual Env* env() = 0;
+
+  // Returns the ConfigProto passed to the session used to create the function.
+  virtual const ConfigProto* const config_proto() = 0;
 
   // Returns a debug string showing the definition of the function of
   // 'handle'.
@@ -793,6 +843,17 @@ class DistributedFunctionLibraryRuntime {
                    FunctionLibraryRuntime::LocalHandle handle,
                    gtl::ArraySlice<Tensor> args, std::vector<Tensor>* rets,
                    FunctionLibraryRuntime::DoneCallback done) = 0;
+
+#if !defined(IS_MOBILE_PLATFORM)
+  // TODO(yujingzhang): Support outputting tensors on remote devices.
+  virtual void Run(const FunctionLibraryRuntime::Options& opts,
+                   FunctionLibraryRuntime::LocalHandle handle,
+                   std::vector<eager::RemoteTensorHandle>* args,
+                   FunctionLibraryRuntime::DoneCallback done) {
+    done(errors::Unimplemented("Unimplemented."));
+  }
+#endif  // IS_MOBILE_PLATFORM
+
   virtual void CleanUp(uint64 step_id,
                        FunctionLibraryRuntime::LocalHandle handle,
                        FunctionLibraryRuntime::DoneCallback done) = 0;

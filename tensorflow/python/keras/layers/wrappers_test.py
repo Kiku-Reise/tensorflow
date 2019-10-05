@@ -28,12 +28,14 @@ from tensorflow.python.eager import context
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import test_util as tf_test_util
+from tensorflow.python.keras import keras_parameterized
+from tensorflow.python.keras import testing_utils
 from tensorflow.python.keras.engine import base_layer_utils
 from tensorflow.python.keras.layers.rnn_cell_wrapper_v2 import ResidualWrapper
 from tensorflow.python.ops.array_ops import concat
 from tensorflow.python.platform import test
-from tensorflow.python.training.tracking import object_identity
 from tensorflow.python.training.tracking import util as trackable_util
+from tensorflow.python.util import object_identity
 
 
 class _RNNCellWithConstants(keras.layers.Layer):
@@ -74,7 +76,7 @@ class _RNNCellWithConstants(keras.layers.Layer):
     return dict(list(base_config.items()) + list(config.items()))
 
 
-class TimeDistributedTest(test.TestCase):
+class TimeDistributedTest(keras_parameterized.TestCase):
 
   @tf_test_util.run_in_graph_and_eager_modes
   def test_timedistributed_dense(self):
@@ -154,11 +156,12 @@ class TimeDistributedTest(test.TestCase):
       model = keras.models.Sequential()
       model.add(
           keras.layers.TimeDistributed(
-              keras.layers.Dense(2, kernel_regularizer='l1'),
+              keras.layers.Dense(2, kernel_regularizer='l1',
+                                 activity_regularizer='l1'),
               input_shape=(3, 4)))
       model.add(keras.layers.Activation('relu'))
       model.compile(optimizer='rmsprop', loss='mse')
-      self.assertEqual(len(model.losses), 1)
+      self.assertEqual(len(model.losses), 2)
 
   def test_TimeDistributed_batchnorm(self):
     with self.cached_session():
@@ -331,6 +334,36 @@ class TimeDistributedTest(test.TestCase):
       self.assertEqual(
           input_layer.compute_output_shape([None, 2, 4]).as_list(),
           [None, 2, 8])
+
+  @keras_parameterized.run_all_keras_modes
+  def test_TimeDistributed_with_mask_first_implementation(self):
+    np.random.seed(100)
+    rnn_layer = keras.layers.LSTM(4, return_sequences=True, stateful=True)
+
+    data = np.array([[[[1.0], [1.0]], [[0.0], [1.0]]],
+                     [[[1.0], [0.0]], [[1.0], [1.0]]],
+                     [[[1.0], [0.0]], [[1.0], [1.0]]]])
+    x = keras.layers.Input(shape=(2, 2, 1), batch_size=3)
+    x_masking = keras.layers.Masking()(x)
+    y = keras.layers.TimeDistributed(rnn_layer)(x_masking)
+    model_1 = keras.models.Model(x, y)
+    model_1.compile(
+        'rmsprop',
+        'mse',
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
+    output_with_mask = model_1.predict(data, steps=1)
+
+    y = keras.layers.TimeDistributed(rnn_layer)(x)
+    model_2 = keras.models.Model(x, y)
+    model_2.compile(
+        'rmsprop',
+        'mse',
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
+    output = model_2.predict(data, steps=1)
+
+    self.assertNotAllClose(output_with_mask, output, atol=1e-7)
 
 
 @tf_test_util.run_all_in_graph_and_eager_modes
@@ -626,11 +659,12 @@ class BidirectionalTest(test.TestCase, parameterized.TestCase):
       x_reachable_loss = x * x
       layer = keras.layers.Bidirectional(
           keras.layers.SimpleRNN(
-              3, kernel_regularizer='l1', bias_regularizer='l1'))
+              3, kernel_regularizer='l1', bias_regularizer='l1',
+              activity_regularizer='l1'))
       _ = layer(x)
-      assert len(layer.losses) == 4
+      assert len(layer.losses) == 6
       assert len(layer.get_losses_for(None)) == 4
-      assert not layer.get_losses_for(x)
+      assert len(layer.get_losses_for(x)) == 2
 
       # Create a random tensor that is not conditional on the inputs.
       with keras.backend.get_graph().as_default():
@@ -640,9 +674,9 @@ class BidirectionalTest(test.TestCase, parameterized.TestCase):
       layer.forward_layer.add_loss(const_tensor, inputs=None)
       layer.backward_layer.add_loss(x_reachable_loss, inputs=x)
       layer.backward_layer.add_loss(const_tensor, inputs=None)
-      assert len(layer.losses) == 8
+      assert len(layer.losses) == 10
       assert len(layer.get_losses_for(None)) == 6
-      assert len(layer.get_losses_for(x)) == 2
+      assert len(layer.get_losses_for(x)) == 4
 
   def test_Bidirectional_with_constants(self):
     with self.cached_session():

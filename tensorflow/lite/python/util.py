@@ -18,16 +18,15 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import copy
 import sys
 
-from tensorflow.core.framework import graph_pb2 as _graph_pb2
 from tensorflow.core.protobuf import config_pb2 as _config_pb2
 from tensorflow.core.protobuf import meta_graph_pb2 as _meta_graph_pb2
 from tensorflow.lite.python.op_hint import convert_op_hints_to_stubs
 from tensorflow.lite.python.op_hint import find_all_hinted_output_nodes
 from tensorflow.lite.toco import types_pb2 as _types_pb2
 from tensorflow.python.eager import function
+from tensorflow.python.framework import convert_to_constants as _convert_to_constants
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import error_interpolation as _error_interpolation
 from tensorflow.python.framework import graph_util as tf_graph_util
@@ -43,10 +42,9 @@ _MAP_TF_TO_TFLITE_TYPES = {
     dtypes.string: _types_pb2.STRING,
     dtypes.uint8: _types_pb2.QUANTIZED_UINT8,
     dtypes.int8: _types_pb2.INT8,
-    dtypes.complex64: _types_pb2.COMPLEX64
+    dtypes.complex64: _types_pb2.COMPLEX64,
+    dtypes.bool: _types_pb2.BOOL,
 }
-
-_LOWER_USING_SWITCH_MERGE = "_lower_using_switch_merge"
 
 
 def convert_dtype_to_tflite_type(tf_dtype):
@@ -191,6 +189,19 @@ def run_graph_optimizations(graph_def,
   """
   meta_graph = _export_meta_graph(graph_def=graph_def, graph=graph)
 
+  signature = _meta_graph_pb2.SignatureDef()
+  for array in input_arrays:
+    signature.inputs[array.name].name = array.name
+    signature.inputs[array.name].dtype = array.dtype.as_datatype_enum
+    signature.inputs[array.name].tensor_shape.CopyFrom(array.shape.as_proto())
+
+  for array in output_arrays:
+    signature.outputs[array.name].name = array.name
+    signature.outputs[array.name].dtype = array.dtype.as_datatype_enum
+    signature.outputs[array.name].tensor_shape.CopyFrom(array.shape.as_proto())
+
+  meta_graph.signature_def["not_used_key"].CopyFrom(signature)
+
   # We need to add a collection called 'train_op' so that grappler
   # knows what the outputs are.
   fetch_collection = _meta_graph_pb2.CollectionDef()
@@ -199,26 +210,6 @@ def run_graph_optimizations(graph_def,
   meta_graph.collection_def["train_op"].CopyFrom(fetch_collection)
 
   return tf_optimizer.OptimizeGraph(config, meta_graph)
-
-
-def _remove_lower_using_switch_merge(graph_def):
-  """Remove '_lower_using_switch_merge' attributes from the given graph.
-
-  Args:
-    graph_def: GraphDef to be optimized.
-
-  Returns:
-    A new GraphDef that with no '_lower_using_switch_merge' attribute.
-  """
-  out = _graph_pb2.GraphDef()
-  out.library.CopyFrom(graph_def.library)
-  out.versions.CopyFrom(graph_def.versions)
-  for node in graph_def.node:
-    new_node = copy.deepcopy(node)
-    if new_node.op == "While":
-      new_node.attr[_LOWER_USING_SWITCH_MERGE].b = False
-    out.node.extend([new_node])
-  return out
 
 
 def _convert_op_hints_if_present(sess, graph_def, output_tensors,
@@ -253,7 +244,8 @@ def freeze_graph(sess, input_tensors, output_tensors):
   # Asides from inlining any simple function, Grappler will also try to lower
   # while loop into switch merge representation which is undesired for Ophints,
   # so we simply remove those attributes to prevent Grappler from doing so.
-  graph_def = _remove_lower_using_switch_merge(sess.graph_def)
+  graph_def = _convert_to_constants.disable_lower_using_switch_merge(
+      sess.graph_def)
   config = get_grappler_config(["function"])
   graph_def = run_graph_optimizations(
       graph_def, input_tensors, output_tensors, config, graph=sess.graph)
@@ -300,6 +292,7 @@ def build_debug_info_func(original_graph):
     A function which retrieves the stack traces from the original graph and
     converts them to a `GraphDebugInfo` for a given set of nodes.
   """
+
   def f(original_nodes):
     """Function to create `GraphDebugInfo` for the given `original_nodes`."""
     if not original_graph:
@@ -333,7 +326,7 @@ def get_debug_info(nodes_to_debug_info_func, converted_graph):
 
   Args:
     nodes_to_debug_info_func: The method to collect the op debug info for the
-    nodes.
+      nodes.
     converted_graph: A `GraphDef` after optimization and transfermation.
 
   Returns:

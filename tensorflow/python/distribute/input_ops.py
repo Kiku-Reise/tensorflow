@@ -56,12 +56,11 @@ def _clone_dataset(dataset):
   variant_tensor_ops = traverse.obtain_all_variant_tensor_ops(dataset)
   remap_dict = _clone_helper(dataset._variant_tensor.op, variant_tensor_ops)
   new_variant_tensor = remap_dict[dataset._variant_tensor.op].outputs[0]
-  return dataset_ops._VariantDataset(new_variant_tensor,
-                                     dataset._element_structure)
+  return dataset_ops._VariantDataset(new_variant_tensor, dataset.element_spec)
 
 
 def _get_op_def(op):
-  return op.op_def or op_def_registry.get_registered_ops()[op.type]
+  return op.op_def or op_def_registry.get(op.type)
 
 
 def _clone_helper(op_to_clone, variant_tensor_ops):

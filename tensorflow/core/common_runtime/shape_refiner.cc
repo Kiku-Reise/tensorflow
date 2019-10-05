@@ -83,7 +83,15 @@ Status InferShapesForFunctionSubNode(const Node* node, ShapeRefiner* refiner,
           " not in [0, ", outer_context->num_inputs(), ").");
     }
 
-    node_context->set_output(0, outer_context->input(index));
+    // TODO(b/134547156): TEMPORARY WORKAROUND. If input shape handle is not set
+    // in outer context, set _Arg node output shape to unknown.
+    if (outer_context->input(index).SameHandle(ShapeHandle())) {
+      LOG(WARNING) << "Function instantiation has undefined input shape at "
+                   << "index: " << index << " in the outer inference context.";
+      node_context->set_output(0, node_context->UnknownShape());
+    } else {
+      node_context->set_output(0, outer_context->input(index));
+    }
 
     auto* resource = outer_context->input_handle_shapes_and_types(index);
     if (resource) {
@@ -210,14 +218,15 @@ Status ShapeRefiner::InferShapesForFunction(
 }
 
 Status ShapeRefiner::AddNode(const Node* node) {
+  // Create the inference context for this node with the existing input shapes.
+  std::unique_ptr<InferenceContext> ic(new InferenceContext(
+      graph_def_version_, &node->def(), node->op_def(),
+      std::vector<ShapeHandle>(node->num_inputs()), {}, {}, {}));
+  TF_RETURN_IF_ERROR(ic->construction_status());
+
   // For each 'input' of this node, fetch the corresponding shape
-  // from 'input's InferenceContext, and store into a vector
-  // indexed by 'node's input.
-  std::vector<const Node*> input_nodes(node->num_inputs());
-  std::vector<ShapeHandle> input_shapes(node->num_inputs());
-  std::vector<std::unique_ptr<std::vector<ShapeAndType>>>
-      input_handle_shapes_and_types(node->num_inputs());
-  std::vector<bool> inputs_missing_context(node->num_inputs());
+  // from 'input's InferenceContext, and store into this node's
+  // InferenceContext.
   for (const Edge* e : node->in_edges()) {
     if (e->IsControlEdge()) continue;
 
@@ -231,25 +240,20 @@ Status ShapeRefiner::AddNode(const Node* node) {
     if (it == node_to_context_.end()) {
       // v1 control flow adds loops to the graph; we have to break them
       // somewhere, so we'll ignore this input and leave its shape undefined.
-      input_nodes[e->dst_input()] = input;
-      // We don't have a context yet. We'll make one below and use that to
-      // generate an unknown shape. An uninitialized ShapeHandle is already an
-      // unknown shape, but there are debug checks that each input was
-      // explicitly set and satisfying them isn't very costly.
-      inputs_missing_context[e->dst_input()] = true;
+      ic->SetInput(e->dst_input(), ic->UnknownShape());
       continue;
     }
 
-    InferenceContext* c = it->second->get_context();
-    input_nodes[e->dst_input()] = input;
-    input_shapes[e->dst_input()] = c->output(e->src_output());
+    InferenceContext* input_ic = it->second->get_context();
+    ic->SetInput(e->dst_input(), input_ic->output(e->src_output()));
 
-    const auto* in_v = c->output_handle_shapes_and_types(e->src_output());
+    const auto* in_v =
+        input_ic->output_handle_shapes_and_types(e->src_output());
     if (in_v != nullptr) {
       DataType input_type = e->src()->output_type(e->src_output());
       DCHECK(input_type == DT_RESOURCE || input_type == DT_VARIANT);
-      input_handle_shapes_and_types[e->dst_input()].reset(
-          new std::vector<ShapeAndType>(*in_v));
+      ic->set_input_handle_shapes_and_types(e->dst_input(),
+                                            std::vector<ShapeAndType>(*in_v));
     }
   }
 
@@ -263,27 +267,8 @@ Status ShapeRefiner::AddNode(const Node* node) {
         "', did you forget to define it?");
   }
 
-  // This needs to be filled in with real data in a second pass.
-  std::vector<const Tensor*> input_tensors(node->num_inputs(), nullptr);
-  std::vector<ShapeHandle> input_tensors_as_shapes;
-
-  // Create the inference context for this node with the existing input shapes.
-  std::unique_ptr<InferenceContext> c(
-      new InferenceContext(graph_def_version_, &node->def(), node->op_def(),
-                           input_shapes, input_tensors, input_tensors_as_shapes,
-                           std::move(input_handle_shapes_and_types)));
-  if (!c->construction_status().ok()) {
-    return c->construction_status();
-  }
-
-  for (unsigned int i = 0; i < input_shapes.size(); ++i) {
-    if (inputs_missing_context[i]) {
-      c->SetInput(i, c->UnknownShape());
-    }
-  }
-
   std::unique_ptr<ExtendedInferenceContext> ec(
-      new ExtendedInferenceContext(std::move(c), node));
+      new ExtendedInferenceContext(std::move(ic), node));
 
   // Run the shape inference function, and return if there was an error.
   TF_RETURN_IF_ERROR(RunShapeFn(node, op_reg_data, ec.get()));
@@ -553,6 +538,13 @@ Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
   } else if (src_op == "StridedSlice") {
     TF_RETURN_IF_ERROR(
         PartialStridedSliceShape(input_edge->src(), src_context, result));
+  } else if (src_op == "VariableShape") {
+    auto* handle_data = src_context->input_handle_shapes_and_types(0);
+    if (handle_data != nullptr && !handle_data->empty()) {
+      *result = handle_data->at(0).shape;
+    } else {
+      *result = target_context->UnknownShape();
+    }
   } else {
     Tensor t;
     bool evaluated = false;

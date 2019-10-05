@@ -23,7 +23,6 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/compiler/tf2tensorrt/convert/utils.h"
-#include "tensorflow/compiler/tf2tensorrt/utils/calibration_resource.h"
 #include "tensorflow/compiler/tf2tensorrt/utils/trt_allocator.h"
 #include "tensorflow/compiler/tf2tensorrt/utils/trt_int8_calibrator.h"
 #include "tensorflow/compiler/tf2tensorrt/utils/trt_logger.h"
@@ -38,8 +37,6 @@ limitations under the License.
 
 namespace tensorflow {
 namespace tensorrt {
-extern const char* const kInputPHName;
-extern const char* const kOutputPHName;
 
 namespace convert {
 
@@ -120,8 +117,8 @@ struct EngineInfo {
   bool use_calibration;
 };
 
-// Constructs a graphdef from the segment in the given graph. Adds placeholder
-// nodes for input edges (InputPH_*) and identity nodes for output edges
+// Constructs a graphdef from the segment in the given graph. Adds _Arg
+// nodes for input edges (InputPH_*) and _Retval nodes for output edges
 // (OutputPH_*). This function needs to be called before TensorRT nodes
 // inserted in order to correctly get sizes from the original graph.
 //
@@ -150,8 +147,9 @@ Status ConvertSegmentToGraphDef(
 Status ConvertGraphDefToEngine(
     const GraphDef& gdef, TrtPrecisionMode precision_mode, int max_batch_size,
     size_t max_workspace_size_bytes,
-    const std::vector<PartialTensorShape>& input_shapes, Logger* logger,
-    nvinfer1::IGpuAllocator* allocator, TRTInt8Calibrator* calibrator,
+    const std::vector<PartialTensorShape>& input_shapes,
+    nvinfer1::ILogger* logger, nvinfer1::IGpuAllocator* allocator,
+    TRTInt8Calibrator* calibrator,
     TrtUniquePtrType<nvinfer1::ICudaEngine>* engine, bool use_calibration,
     bool* convert_successfully);
 
@@ -353,23 +351,27 @@ class Converter;
 
 // Parameters for each op converter.
 struct OpConverterParams {
-  OpConverterParams(Converter* arg_converter, const NodeDef& arg_node_def,
-                    const std::vector<TRT_TensorOrWeights>& arg_inputs,
-                    std::vector<TRT_TensorOrWeights>* arg_outputs,
-                    bool arg_validation_only, TrtWeightStore* arg_weight_store)
-      : converter(arg_converter),
-        node_def(arg_node_def),
-        inputs(arg_inputs),
-        outputs(arg_outputs),
-        validation_only(arg_validation_only),
-        weight_store(arg_weight_store) {}
+  // Constructor used for validation only.
+  OpConverterParams(const NodeDef& node_def,
+                    const std::vector<TRT_TensorOrWeights>& inputs,
+                    std::vector<TRT_TensorOrWeights>* outputs,
+                    TrtWeightStore* weight_store,
+                    TrtPrecisionMode precision_mode, bool use_calibration);
 
-  Converter* converter;
+  // Constructor used for conversion.
+  OpConverterParams(Converter* converter, const NodeDef& node_def,
+                    const std::vector<TRT_TensorOrWeights>& inputs,
+                    std::vector<TRT_TensorOrWeights>* outputs,
+                    TrtWeightStore* weight_store);
+
+  Converter* converter = nullptr;
   const NodeDef& node_def;
   const std::vector<TRT_TensorOrWeights>& inputs;
   std::vector<TRT_TensorOrWeights>* outputs;
   const bool validation_only;
   TrtWeightStore* weight_store;
+  const TrtPrecisionMode precision_mode;
+  const bool use_calibration;
 };
 
 using OpConverter = std::function<Status(OpConverterParams*)>;
@@ -381,7 +383,7 @@ class TrtNodeValidator {
   // checked by IsTensorRTCandidate() later. It is used to get the shape and
   // data type information of a tensor for validation purpose.
   TrtNodeValidator(const grappler::GraphProperties& graph_properties,
-                   TrtPrecisionMode precision_mode);
+                   TrtPrecisionMode precision_mode, bool use_calibration);
 
   // Returns OK iff 'node' is a TF-TRT conversion candidate, which will be added
   // to TRT subgraph and later converted into TRT engine.
@@ -419,6 +421,8 @@ class TrtNodeValidator {
   // Quantization ops are only converted when using quantized precisions.
   const TrtPrecisionMode precision_mode_;
 
+  const bool use_calibration_;
+
   friend class ValidatorTest;
   friend class OpConverterTest;
 };
@@ -440,7 +444,8 @@ class Converter {
   };
 
   Converter(nvinfer1::INetworkDefinition* trt_network,
-            TrtPrecisionMode precision_mode, bool use_calibration);
+            TrtPrecisionMode precision_mode, bool use_calibration,
+            nvinfer1::ILogger* trt_logger);
 
   //////////////////////////////////////////////////////////////////////////////
   // Methods used by the TRT engine builder to build a TRT network from a TF
@@ -581,9 +586,11 @@ class Converter {
 };
 
 // Return OK if the broadcast scheme is supported and compute the shapes after
-// broadcasting.
+// broadcasting. check_feasibility can be set to false in cases where dimensions
+// do not need to match exactly (as in the case of BatchMatMulV2).
 Status GetTrtBroadcastShape(const TRT_TensorOrWeights& operand_l,
                             const TRT_TensorOrWeights& operand_r,
+                            const bool check_feasibility,
                             nvinfer1::Dims* operand_l_new_dims,
                             nvinfer1::Dims* operand_r_new_dims);
 

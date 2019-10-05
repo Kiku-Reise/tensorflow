@@ -16,12 +16,11 @@ limitations under the License.
 #define TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_CLUSTER_FUNCTION_LIBRARY_RUNTIME_H_
 
 #include "tensorflow/core/distributed_runtime/worker_interface.h"
-#include "tensorflow/core/distributed_runtime/worker_session.h"
 #include "tensorflow/core/framework/function.h"
 
 namespace tensorflow {
 
-struct WorkerSession;
+class WorkerSession;
 
 // ClusterFunctionLibraryRuntime contains methods to Instantiate and Run
 // functions across processes by making RPCs.
@@ -54,7 +53,8 @@ class ClusterFunctionLibraryRuntime : public DistributedFunctionLibraryRuntime {
  private:
   static Status ConstructFunctionGraph(
       const OpDef& sig, AttrSlice attrs,
-      const FunctionLibraryRuntime::InstantiateOptions& options, GraphDef* g,
+      const FunctionLibraryRuntime::InstantiateOptions& options,
+      const FunctionLibraryDefinition& flib_def, GraphDef* g,
       std::vector<string>* send_keys, std::vector<string>* recv_keys);
   friend class ClusterFunctionLibraryRuntimeTest;
 

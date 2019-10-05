@@ -48,6 +48,7 @@ tf_cc_test(
         "//tensorflow/core:lib",
         "//tensorflow/lite:framework",
         "//tensorflow/lite/kernels:builtin_ops",
+        "@com_google_absl//absl/memory",
         "@com_google_googletest//:gtest",
     ],
 )
@@ -88,9 +89,10 @@ cc_library(
 
 cc_library(
     name = "calibration_logger",
+    srcs = ["calibration_logger.cc"],
     hdrs = ["calibration_logger.h"],
     deps = [
-        "//tensorflow/core:tflite_portable_logging",
+        "//tensorflow/lite:minimal_logging",
         "//tensorflow/lite/c:c_api_internal",
     ],
 )

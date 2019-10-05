@@ -307,7 +307,9 @@ class FakeITensor : public nvinfer1::ITensor {
 
   nvinfer1::TensorFormats getAllowedFormats() const override { return 1; }
 
-  bool isShape() const override { return false; }
+  bool isShapeTensor() const override { return false; }
+  bool isExecutionTensor() const override { return true; }
+
 #endif
 
  private:
@@ -460,7 +462,8 @@ class ValidatorTest : public ::testing::Test {
     grappler::GraphProperties graph_properties(item);
     TF_EXPECT_OK(graph_properties.InferStatically(true));
 
-    TrtNodeValidator validator(graph_properties, TrtPrecisionMode::FP32);
+    TrtNodeValidator validator(graph_properties, TrtPrecisionMode::FP32,
+                               /*use_calibration=*/false);
     return validator.ConvertToTensorOrWeights(node->def(), output_port,
                                               tensor_or_weights);
   }
@@ -473,7 +476,8 @@ class ValidatorTest : public ::testing::Test {
 TEST_F(ValidatorTest, QuantizeOpsAreRegistered) {
   grappler::GrapplerItem item;
   grappler::GraphProperties graph_properties(item);
-  TrtNodeValidator validator(graph_properties, TrtPrecisionMode::FP32);
+  TrtNodeValidator validator(graph_properties, TrtPrecisionMode::FP32,
+                             /*use_calibration=*/false);
   for (const string& quantize_op : *GetQuantizeOps(&validator)) {
     QCHECK(op_validators(&validator).count(quantize_op));
   }
@@ -542,7 +546,8 @@ TEST_F(ValidatorTest, IsTensorRTCandidate_Basics) {
   TF_EXPECT_OK(s.ToGraphDef(&item.graph));
   grappler::GraphProperties graph_properties(item);
   TF_EXPECT_OK(graph_properties.InferStatically(true));
-  TrtNodeValidator validator(graph_properties, TrtPrecisionMode::FP32);
+  TrtNodeValidator validator(graph_properties, TrtPrecisionMode::FP32,
+                             /*use_calibration=*/false);
 
   bool start_conversion = false;
   bool should_fail = false;
@@ -620,7 +625,8 @@ TEST(TrtNodeValidator, IsTensorRTCandidate) {
 
   for (const TrtPrecisionMode precision_mode :
        {TrtPrecisionMode::FP32, TrtPrecisionMode::INT8}) {
-    TrtNodeValidator validator(graph_properties, precision_mode);
+    TrtNodeValidator validator(graph_properties, precision_mode,
+                               /*use_calibration=*/false);
     TF_EXPECT_OK(validator.IsTensorRTCandidate(matmul.operation.node()));
     ExpectStatus(
         validator.IsTensorRTCandidate(incompatible_matmul.operation.node()),
@@ -651,7 +657,7 @@ class ConverterTest : public ::testing::Test {
     builder_.reset(nvinfer1::createInferBuilder(logger_));
     network_.reset(builder_->createNetwork());
     converter_.reset(new Converter(network_.get(), TrtPrecisionMode::FP32,
-                                   /*use_calibration=*/false));
+                                   /*use_calibration=*/false, &logger_));
     weight_store_ = &converter_->weight_store_;
   }
 
@@ -989,8 +995,9 @@ TEST_F(ConverterTest, MaybeApplyQuantizationRanges) {
   // input -> infer1 -> infer2 -> infer3
   FakeITensor input, infer_1, infer_2, infer_3;
   FakeITensor not_infer;
+  Logger logger;
   Converter int8_converter(/*trt_network=*/nullptr, TrtPrecisionMode::INT8,
-                           /*use_calibration=*/true);
+                           /*use_calibration=*/true, &logger);
   int8_converter.ProvideQuantizationRange(&input, -5.0f, 5.0f);
   int8_converter.ProvideQuantizationRange(&not_infer, -100.0f, 100.0f);
   int8_converter.MarkQuantizationRangesAsInferrable(&input, &infer_1);
@@ -1061,17 +1068,19 @@ TEST_F(ConverterTest, GetTrtBroadcastShape) {
         operand_2_shape, operand_2_is_tensor, operand_2_batch_size);
 
     // operand_1 broadcast operand_2
-    ExpectStatus(GetTrtBroadcastShape(operand_1, operand_2, &operand_1_new_dims,
-                                      &operand_2_new_dims),
-                 expected_code, expected_error_msg_substr);
+    ExpectStatus(
+        GetTrtBroadcastShape(operand_1, operand_2, /*check_feasibility=*/true,
+                             &operand_1_new_dims, &operand_2_new_dims),
+        expected_code, expected_error_msg_substr);
     if (expected_code == error::OK) {
       ExpectTrtDimsEqualsArray(expected_operand_1_shape, operand_1_new_dims);
       ExpectTrtDimsEqualsArray(expected_operand_2_shape, operand_2_new_dims);
     }
     // operand_2 broadcast operand_1
-    ExpectStatus(GetTrtBroadcastShape(operand_2, operand_1, &operand_2_new_dims,
-                                      &operand_1_new_dims),
-                 expected_code, expected_error_msg_substr);
+    ExpectStatus(
+        GetTrtBroadcastShape(operand_2, operand_1, /*check_feasibility=*/true,
+                             &operand_2_new_dims, &operand_1_new_dims),
+        expected_code, expected_error_msg_substr);
     if (expected_code == error::OK) {
       ExpectTrtDimsEqualsArray(expected_operand_1_shape, operand_1_new_dims);
       ExpectTrtDimsEqualsArray(expected_operand_2_shape, operand_2_new_dims);
@@ -1152,7 +1161,7 @@ class ConvertGraphDefToEngineTest : public ::testing::Test {
     int batch_size = -1;
     for (const NodeDef& node : gdef.node()) {
       absl::string_view node_name(node.name());
-      if (absl::ConsumePrefix(&node_name, kInputPHName)) {
+      if (absl::ConsumePrefix(&node_name, IONamePrefixes::kInputPHName)) {
         int port = -1;
         EXPECT_TRUE(absl::SimpleAtoi(node_name, &port)) << node.name();
         if (input_shapes.size() < port + 1) input_shapes.resize(port + 1);
@@ -1182,11 +1191,13 @@ class ConvertGraphDefToEngineTest : public ::testing::Test {
 
 TEST_F(ConvertGraphDefToEngineTest, IdentityGraph) {
   Scope s = Scope::NewRootScope();
-  auto input = ops::Placeholder(s.WithOpName(StrCat(kInputPHName, 0)), DT_FLOAT,
-                                ops::Placeholder::Shape({1, 1}));
+  auto input =
+      ops::Placeholder(s.WithOpName(StrCat(IONamePrefixes::kInputPHName, 0)),
+                       DT_FLOAT, ops::Placeholder::Shape({1, 1}));
   auto output = ops::Identity(s.WithOpName("identity1"), input);
   output = ops::Identity(s.WithOpName("identity2"), output);
-  output = ops::Identity(s.WithOpName(StrCat(kOutputPHName, 0)), output);
+  output = ops::Identity(s.WithOpName(StrCat(IONamePrefixes::kOutputPHName, 0)),
+                         output);
   // If the converter marks the input tensor as output tensor, the conversion
   // below will fail with:
   // > TensorRTOutputPH_0 cannot be both input and output
@@ -1247,7 +1258,7 @@ class OpConverterTest : public ::testing::Test {
 
     // Reset the converter.
     converter_.reset(new Converter(network_.get(), precision_mode_to_test_,
-                                   /*use_calibration=*/false));
+                                   /*use_calibration=*/false, &logger_));
 
     // Reset other related artifacts.
     scope_ = Scope::NewRootScope();
@@ -1402,7 +1413,8 @@ class OpConverterTest : public ::testing::Test {
     grappler::GraphProperties graph_properties(item);
     TF_EXPECT_OK(graph_properties.InferStatically(true));
 
-    TrtNodeValidator validator(graph_properties, precision_mode_to_test_);
+    TrtNodeValidator validator(graph_properties, precision_mode_to_test_,
+                               /*use_calibration=*/false);
     ExpectStatus(validator.IsTensorRTCandidate(node), expected_code,
                  expected_msg_substr);
   }
@@ -1446,6 +1458,9 @@ class OpConverterTest : public ::testing::Test {
     return converter_->quantization_ranges_;
   }
 
+  void PropagateQuantizationRanges() {
+    converter_->PropagateQuantizationRanges();
+  }
   std::unique_ptr<Converter> converter_;
 
  protected:
@@ -1789,16 +1804,9 @@ void TestMatMulHelper(
       test->AddTestTensor("input", {2}, /*batch_size=*/1);
       test->AddTestWeights<float>("weights", {2, 2}, {0, 1, 2, 3});
       if (is_batch_matmul) {
-        if (transpose_a || transpose_b) {
-          test->RunValidationAndConversion(
-              node_def, error::INVALID_ARGUMENT,
-              "Input weight attempts to broadcast across batch dimension for "
-              "BatchMatMul, at my_matmul");
-        } else {
-          test->RunValidationAndConversion(
-              node_def, error::INVALID_ARGUMENT,
-              "Input weight attempts to broadcast across batch dimension");
-        }
+        test->RunValidationAndConversion(
+            node_def, error::UNIMPLEMENTED,
+            "TensorRT does not support batched constants.");
         continue;
       } else if (transpose_a) {
         test->RunValidationAndConversion(
@@ -1830,16 +1838,9 @@ void TestMatMulHelper(
     test->AddTestTensor("input", {2}, /*batch_size=*/1);
     test->AddTestWeights<float>("weights", {2, 2}, {0, 1, 2, 3});
     if (is_batch_matmul) {
-      if (transpose_b) {
-        test->RunValidationAndConversion(
-            node_def, error::INVALID_ARGUMENT,
-            "Input weight attempts to broadcast across batch dimension for "
-            "BatchMatMul, at my_matmul");
-      } else {
-        test->RunValidationAndConversion(
-            node_def, error::INVALID_ARGUMENT,
-            "Input weight attempts to broadcast across batch dimension");
-      }
+      test->RunValidationAndConversion(
+          node_def, error::UNIMPLEMENTED,
+          "TensorRT does not support batched constants.");
       continue;
     }
     test->RunValidationAndConversion(node_def);
@@ -1856,6 +1857,18 @@ void TestMatMulHelper(
       EXPECT_THAT(GetSpanForData<float>(output_data[0]), ElementsAre(2, 3));
     }
   }
+}
+
+template <typename LayerType>
+void CheckAddedLayers(OpConverterTest* test, bool expect_found) {
+  bool layer_found = false;
+  for (int i = 0; i < test->converter_->network()->getNbLayers(); i++) {
+    nvinfer1::ILayer* layer = test->converter_->network()->getLayer(i);
+    if (dynamic_cast<LayerType*>(layer)) {
+      layer_found = true;
+    }
+  }
+  EXPECT_EQ(expect_found, layer_found);
 }
 
 TEST_F(OpConverterTest, ConvertMatMul) {
@@ -1905,6 +1918,31 @@ TEST_F(OpConverterTest, ConvertMatMul) {
         node_def, error::INVALID_ARGUMENT,
         "Cannot currently transpose constant input if it is not 2 dimensional");
   }
+  {
+    // Make sure that INT8 mode uses IFullyConnectedLayer when possible.
+    precision_mode_to_test_ = TrtPrecisionMode::INT8;
+    Reset();
+    NodeDef node_def = get_matmul_nodedef(DT_FLOAT, false, false);
+    AddTestTensor("input", {2, 1, 1});
+    AddTestWeights<float>("weights", {2, 2}, {0, 1, 2, 3});
+    RunValidationAndConversion(node_def);
+    CheckAddedLayers<nvinfer1::IMatrixMultiplyLayer>(this, false);
+    CheckAddedLayers<nvinfer1::IFullyConnectedLayer>(this, true);
+    precision_mode_to_test_ = TrtPrecisionMode::FP32;
+  }
+  {
+    // Make sure that INT8 mode doesn't try to use IFullyConnectedLayer when not
+    // compatible. In this case we can't use FC because weights is a tensor.
+    precision_mode_to_test_ = TrtPrecisionMode::INT8;
+    Reset();
+    NodeDef node_def = get_matmul_nodedef(DT_FLOAT, false, false);
+    AddTestTensor("input", {2, 1, 1});
+    AddTestTensor("weights", {2, 2});
+    RunValidationAndConversion(node_def);
+    CheckAddedLayers<nvinfer1::IMatrixMultiplyLayer>(this, true);
+    CheckAddedLayers<nvinfer1::IFullyConnectedLayer>(this, false);
+    precision_mode_to_test_ = TrtPrecisionMode::FP32;
+  }
   TestMatMulHelper(this, get_matmul_nodedef, "MatMul");
 }
 
@@ -1921,6 +1959,30 @@ TEST_F(OpConverterTest, ConvertBatchMatMul) {
                                    matmul_attrs);
     return matmul.operation.node()->def();
   };
+
+  {
+    // Can't broadcast two tensor inputs of different rank.
+    Reset();
+    NodeDef node_def = get_batch_matmul_nodedef(DT_FLOAT, false, false);
+    AddTestTensor("input", {1, 2, 2}, /*batch_size=*/2);
+    AddTestTensor("weights", {2}, /*batch_size=*/2);
+    RunValidationAndConversion(
+        node_def, error::UNIMPLEMENTED,
+        "Inputs must have the same rank if they are both tensors.");
+  }
+  {
+    // Make sure that INT8 mode doesn't try to use IFullyConnectedLayer when not
+    // compatible. In this case we can't use FC because transpose_a is true.
+    precision_mode_to_test_ = TrtPrecisionMode::INT8;
+    Reset();
+    NodeDef node_def = get_batch_matmul_nodedef(DT_FLOAT, true, false);
+    AddTestTensor("input", {1, 2, 2});
+    AddTestWeights<float>("weights", {2, 2}, {0, 1, 2, 3});
+    RunValidationAndConversion(node_def);
+    CheckAddedLayers<nvinfer1::IMatrixMultiplyLayer>(this, true);
+    CheckAddedLayers<nvinfer1::IFullyConnectedLayer>(this, false);
+    precision_mode_to_test_ = TrtPrecisionMode::FP32;
+  }
 
   for (bool transpose_a : {false, true}) {
     for (bool transpose_b : {false, true}) {
@@ -2049,21 +2111,6 @@ NodeDef GetBinaryOpNodeDef(const string& input_name_l,
   auto input_r = ops::Placeholder(s.WithOpName(input_name_r), dtype);
   auto op = OpType(s.WithOpName("my_binary"), input_l, input_r);
   return op.operation.node()->def();
-}
-
-void CheckAddedLayers(OpConverterTest* test, bool expect_scale_layer) {
-  bool element_wise_layer_found = false;
-  bool scale_layer_found = false;
-  for (int i = 0; i < test->converter_->network()->getNbLayers(); i++) {
-    nvinfer1::ILayer* layer = test->converter_->network()->getLayer(i);
-    if (dynamic_cast<nvinfer1::IScaleLayer*>(layer)) {
-      scale_layer_found = true;
-    } else if (dynamic_cast<nvinfer1::IElementWiseLayer*>(layer)) {
-      element_wise_layer_found = true;
-    }
-  }
-  EXPECT_EQ(expect_scale_layer, scale_layer_found);
-  EXPECT_NE(expect_scale_layer, element_wise_layer_found);
 }
 
 template <typename OpType, DataType dtype>
@@ -3053,6 +3100,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
     int begin_mask;
     int end_mask;
     int ellipsis_mask;
+    int new_axis_mask;
+    int shrink_axis_mask;
     std::vector<int> expected_output_dims;
     std::vector<float> expected_output;
   };
@@ -3069,9 +3118,9 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
   const std::vector<float> ok_input = {1, 2, 3, 4, 5, 6};
 
 #if IS_TRT_VERSION_GE(5, 1, 3, 1)
-  const int kStridedSliceOKCases = 28;
+  const int kStridedSliceOKCases = 31;
 #else
-  const int kStridedSliceOKCases = 24;
+  const int kStridedSliceOKCases = 27;
 #endif
   // Ok.
   TestParams ok_params[kStridedSliceOKCases] = {
@@ -3084,6 +3133,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 1, 2},
         /*expected_output=*/{1, 2},
     },
@@ -3095,6 +3146,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 1, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 1, 2},
         /*expected_output=*/{5, 6},
     },
@@ -3106,6 +3159,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 1, 2},
         /*expected_output=*/{5, 6},
     },
@@ -3118,6 +3173,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{1, 2},
     },
@@ -3129,6 +3186,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{5, 6},
     },
@@ -3140,6 +3199,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 1, 2},
         /*expected_output=*/{1, 2},
     },
@@ -3151,6 +3212,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 1, 2},
         /*expected_output=*/{5, 6},
     },
@@ -3163,6 +3226,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2},
         /*expected_output=*/{1, 2},
     },
@@ -3174,6 +3239,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2},
         /*expected_output=*/{5, 6},
     },
@@ -3186,6 +3253,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 2},
         /*expected_output=*/{1, 2, 4, 5},
     },
@@ -3197,6 +3266,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 1, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 1, 3},
         /*expected_output=*/{4, 5, 6},
     },
@@ -3209,6 +3280,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 1, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 3, 1},
         /*expected_output=*/{1, 2, 3},
     },
@@ -3220,6 +3293,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 1, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 3, 1},
         /*expected_output=*/{4, 5, 6},
     },
@@ -3232,6 +3307,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0}),
         /*end_mask=*/get_mask({1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{3},
         /*expected_output=*/{1, 2, 3},
     },
@@ -3243,6 +3320,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0}),
         /*end_mask=*/get_mask({1, 1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 3},
         /*expected_output=*/{3, 4, 5},
     },
@@ -3254,6 +3333,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{3, 1},
         /*expected_output=*/{3, 4, 5},
     },
@@ -3266,6 +3347,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{3, 1},
         /*expected_output=*/{1, 2, 3},
     },
@@ -3277,6 +3360,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 1}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{5, 1},
         /*expected_output=*/{1, 2, 3, 4, 5},
     },
@@ -3289,6 +3374,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 3},
         /*expected_output=*/{1, 2, 3, 4, 5, 6},
     },
@@ -3302,6 +3389,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0}),
         /*end_mask=*/get_mask({1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{3},
         /*expected_output=*/{1, 3, 5},
     },
@@ -3313,6 +3402,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0}),
         /*end_mask=*/get_mask({1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{3},
         /*expected_output=*/{1, 3, 5},
     },
@@ -3324,6 +3415,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0}),
         /*end_mask=*/get_mask({1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{3},
         /*expected_output=*/{2, 4, 6},
     },
@@ -3335,6 +3428,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0}),
         /*end_mask=*/get_mask({1, 0}),
         /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{2},
         /*expected_output=*/{3, 6},
     },
@@ -3348,6 +3443,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({0, 0, 0, 0}),
         /*ellipsis_mask=*/get_mask({1, 0, 0, 0}),
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{2, 5},
     },
@@ -3359,6 +3456,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({1, 0, 0, 0}),
         /*end_mask=*/get_mask({1, 0, 0, 0}),
         /*ellipsis_mask=*/get_mask({0, 1, 0, 0}),
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{2, 5},
     },
@@ -3370,6 +3469,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({0, 0, 0, 0}),
         /*ellipsis_mask=*/get_mask({1, 0, 0, 0}),
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{2, 5},
     },
@@ -3381,6 +3482,8 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({0, 0, 0, 0}),
         /*ellipsis_mask=*/get_mask({0, 1, 0, 0}),
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{2, 5},
     },
@@ -3392,16 +3495,59 @@ TEST_F(OpConverterTest, ConvertStridedSlice) {
         /*begin_mask=*/get_mask({0, 0, 0, 0}),
         /*end_mask=*/get_mask({0, 0, 0, 0}),
         /*ellipsis_mask=*/get_mask({1, 0, 0, 0}),
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/0,
         /*expected_output_dims=*/{1, 2, 1},
         /*expected_output=*/{2, 5},
+    },
+    // shrink_axis_mask
+    TestParams{
+        /*input_dims=*/{1, 2, 3},
+        /*begin=*/{0, 0, 0, 1},
+        /*end=*/{0, 0, 0, 2},
+        /*strides=*/{1, 1, 1, 1},
+        /*begin_mask=*/get_mask({1, 1, 1, 0}),
+        /*end_mask=*/get_mask({1, 1, 1, 0}),
+        /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/get_mask({0, 0, 0, 1}),
+        /*expected_output_dims=*/{1, 2},
+        /*expected_output=*/{2, 5},
+    },
+    TestParams{
+        /*input_dims=*/{1, 2, 3},
+        /*begin=*/{0, 0, 0, 1},
+        /*end=*/{0, 1, 2, 2},
+        /*strides=*/{1, 1, 1, 1},
+        /*begin_mask=*/get_mask({1, 0, 0, 0}),
+        /*end_mask=*/get_mask({1, 0, 0, 0}),
+        /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/get_mask({0, 1, 0, 1}),
+        /*expected_output_dims=*/{2},
+        /*expected_output=*/{2, 5},
+    },
+    TestParams{
+        /*input_dims=*/{6},
+        /*begin=*/{0, 0},
+        /*end=*/{0, 1},
+        /*strides=*/{1, 1},
+        /*begin_mask=*/get_mask({1, 0}),
+        /*end_mask=*/get_mask({1, 0}),
+        /*ellipsis_mask=*/0,
+        /*new_axis_mask=*/0,
+        /*shrink_axis_mask=*/get_mask({0, 1}),
+        /*expected_output_dims=*/{},
+        /*expected_output=*/{1},
     },
   };
 
   for (int i = 0; i < kStridedSliceOKCases; i++) {
     Reset();
-    NodeDef node_def = get_strided_slice_nodedef(ok_params[i].begin_mask,
-                                                 ok_params[i].end_mask,
-                                                 ok_params[i].ellipsis_mask);
+    NodeDef node_def = get_strided_slice_nodedef(
+        ok_params[i].begin_mask, ok_params[i].end_mask,
+        ok_params[i].ellipsis_mask, ok_params[i].new_axis_mask,
+        ok_params[i].shrink_axis_mask);
     AddTestTensor("input", ok_params[i].input_dims);
     AddTestWeights<int32>("begin",
                           {static_cast<int>(ok_params[i].begin.size())},
@@ -3832,6 +3978,340 @@ TEST_F(OpConverterTest, ConvertConv2D) {
                 ElementsAreArray(ok_params[i].expected_output));
   }
 }
+
+#if IS_TRT_VERSION_GE(6, 0, 0, 0)
+TEST_F(OpConverterTest, ConvertConv3D) {
+  // Get nodedef for Conv3D layer.
+  auto get_conv3d_nodedef =
+      [](std::vector<int> strides = {1, 1, 1, 1, 1}, string padding = "SAME",
+         string data_format = "NCDHW",
+         std::vector<int> dilations = {1, 1, 1, 1, 1},
+         bool is_conv3d_backprop_input = false) -> NodeDef {
+    Scope s = Scope::NewRootScope();
+    auto input = ops::Placeholder(s.WithOpName("input"), DT_FLOAT);
+    auto filter = ops::Placeholder(s.WithOpName("weights"), DT_FLOAT);
+
+    if (is_conv3d_backprop_input) {
+      auto input_sizes =
+          ops::Placeholder(s.WithOpName("input_sizes"), DT_INT32);
+      ops::Conv3DBackpropInputV2::Attrs attrs =
+          ops::Conv3DBackpropInputV2::Attrs()
+              .DataFormat(data_format)
+              .Dilations(dilations);
+      auto conv3d =
+          ops::Conv3DBackpropInputV2(s.WithOpName("my_conv3d"), input_sizes,
+                                     filter, input, strides, padding, attrs);
+      return conv3d.operation.node()->def();
+    } else {
+      ops::Conv3D::Attrs attrs =
+          ops::Conv3D::Attrs().DataFormat(data_format).Dilations(dilations);
+      auto conv3d = ops::Conv3D(s.WithOpName("my_conv3d"), input, filter,
+                                strides, padding, attrs);
+      return conv3d.operation.node()->def();
+    }
+  };
+
+  {
+    // Input is weights, should fail.
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef();
+
+    AddTestWeights<float>("input", {1, 2, 3}, {1, 2, 3, 4, 5, 6});
+    AddTestWeights<float>("weights", {3, 3, 1, 1}, {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    RunValidationAndConversion(
+        node_def, error::UNIMPLEMENTED,
+        "The input \"input\" for Conv3D must be a tensor, at my_conv3d");
+  }
+  {
+    // Filter is tensor, should fail.
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef();
+    AddTestTensor("input", {1, 2, 3});
+    AddTestTensor("weights", {3, 3, 1, 1, 3, 3, 1, 1});
+    RunValidationAndConversion(
+        node_def, error::UNIMPLEMENTED,
+        "The input \"filter\" for Conv3D must be a constant, at my_conv3d");
+  }
+  {
+    // Filter is not 5D, should fail.
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef();
+    AddTestTensor("input", {1, 2, 3});
+    AddTestWeights<float>("weights", {3, 3, 1, 1}, {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    RunValidationAndConversion(
+        node_def, error::INVALID_ARGUMENT,
+        "Conv3D expects kernel of dimension 5, at my_conv3d");
+  }
+  {
+    // Dilations is not 5D, should fail.
+    Reset();
+    NodeDef node_def =
+        get_conv3d_nodedef({1, 1, 1, 1, 1}, "SAME", "NCDHW", {1, 1, 1, 1});
+    AddTestTensor("input", {1, 2, 3});
+    AddTestWeights<float>(
+        "weights", {3, 3, 1, 1, 1},
+        {1, 2, 3, 4, 5, 6, 7, 8, 9});  // Dimensions, then values
+    RunValidationAndConversion(
+        node_def, error::INVALID_ARGUMENT,
+        "Convolution dilations field must specify 5 dimensions, at my_conv3d");
+  }
+  {
+    // Dilation value is not 1 for channel, should fail.
+    Reset();
+    NodeDef node_def =
+        get_conv3d_nodedef({1, 1, 1, 1, 1}, "SAME", "NCDHW", {1, 2, 1, 1, 1});
+    AddTestTensor("input", {1, 2, 3});
+    AddTestWeights<float>("weights", {3, 3, 1, 1, 1},
+                          {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    RunValidationAndConversion(node_def, error::UNIMPLEMENTED,
+                               "Dilation rate must be 1 for batch and channel "
+                               "dimensions, at my_conv3d");
+  }
+  {
+    // Dilation value is not 1 for channel (NDHWC), should fail.
+    Reset();
+    NodeDef node_def =
+        get_conv3d_nodedef({1, 1, 1, 1, 1}, "SAME", "NDHWC", {1, 1, 1, 1, 2});
+    AddTestTensor("input", {2, 3, 1});
+    AddTestWeights<float>("weights", {3, 3, 1, 1, 1},
+                          {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    RunValidationAndConversion(node_def, error::UNIMPLEMENTED,
+                               "Dilation rate must be 1 for batch and channel "
+                               "dimensions, at my_conv3d");
+  }
+  {
+    // Dilation + Conv3DBackpropInputV2, should fail.
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef({1, 1, 1, 1, 1}, "SAME", "NDHWC",
+                                          {1, 1, 2, 1, 1}, true);
+    AddTestTensor("input", {2, 3, 1});
+    AddTestWeights<float>("weights", {3, 3, 1, 1, 1},
+                          {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    AddTestWeights<int>("input_sizes", {4}, {1, 2, 3, 1});
+    RunValidationAndConversion(node_def, error::UNIMPLEMENTED,
+                               "Dilation with Conv3DBackpropInputV2 "
+                               "(conv3d_transpose) is not supported, "
+                               "at my_conv3d");
+  }
+  {
+    // Asymmetric+ Conv3DBackpropInputV2, should fail.
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef({1, 1, 1, 1, 1}, "SAME", "NDHWC",
+                                          {1, 1, 1, 1, 1}, true);
+    AddTestTensor("input", {1, 2, 2, 2});
+    AddTestWeights<float>("weights", {1, 1, 2, 1, 1}, {1, 1});
+    AddTestWeights<int>("input_sizes", {8}, {1, 2, 3, 4, 5, 6, 7, 8});
+    RunValidationAndConversion(node_def, error::UNIMPLEMENTED,
+                               "Asymmetric padding with Conv3DBackpropInputV2 "
+                               "(conv3d_transpose) is not supported, at "
+                               "my_conv3d");
+  }
+  {
+    // Strides is not 5D, should fail.
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef({1, 1, 1, 1, 1, 1}, "SAME", "NCDHW",
+                                          {1, 1, 1, 1, 1});
+    AddTestTensor("input", {1, 2, 2, 2});
+    AddTestWeights<float>("weights", {1, 1, 2, 1, 1}, {1, 1});
+    RunValidationAndConversion(
+        node_def, error::INVALID_ARGUMENT,
+        "Convolution strides field must specify 5 dimensions, at my_conv3d");
+  }
+  {
+    // Stride value is not 1 for channel, should fail.
+    Reset();
+    NodeDef node_def =
+        get_conv3d_nodedef({1, 2, 1, 1, 1}, "SAME", "NCDHW", {1, 1, 1, 1, 1});
+    AddTestTensor("input", {1, 2, 3});
+    AddTestWeights<float>("weights", {3, 3, 1, 1, 1},
+                          {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    RunValidationAndConversion(
+        node_def, error::UNIMPLEMENTED,
+        "Stride must be 1 for batch and channel dimensions, at my_conv3d");
+  }
+  struct TestParams {
+    std::vector<int> input_dims;
+    std::vector<float> input;
+    std::vector<int> filter_dims;
+    std::vector<float> filter;
+    std::vector<int> strides;
+    string padding;
+    string data_format;
+    std::vector<int> dilations;
+    bool is_conv3d_backprop_input;
+    std::vector<int> expected_output_dims;
+    std::vector<float> expected_output;
+  };
+
+  // Start here
+  const int kConv3DOKCases = 8;
+  TestParams ok_params[kConv3DOKCases] = {
+      // Basic - just 1x1 conv - input = output
+      TestParams{
+          /*input_dims=*/{1, 3, 3, 3},  // CDHW
+          /*input=*/{1, 2,  15,  3, 6,  -3, 22, 1, 88, 56, 36, 1,  1, 105,
+                     1, 16, -28, 1, 42, 9,  3,  1, 7,  1,  11, 61, 5},
+          /*filter_dims=*/{1, 1, 1, 1, 1},  // DRSCK
+          /*filter=*/{1},
+          /*strides=*/{1, 1, 1, 1, 1},
+          /*padding=*/"VALID",
+          /*data_format=*/"NCDHW",
+          /*dilations=*/{1, 1, 1, 1, 1},
+          /*is_conv3d_backprop_input=*/false,
+          /*expected_output_dims=*/{1, 3, 3, 3},
+          /*expected_output=*/{1,  2,  15, 3, 6,   -3, 22, 1,   88,
+                               56, 36, 1,  1, 105, 1,  16, -28, 1,
+                               42, 9,  3,  1, 7,   1,  11, 61,  5}},
+      // Basic - 2x1 filter
+      TestParams{/*input_dims=*/{1, 3, 3, 3},  // CDHW
+                 /*input=*/{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6},
+                 /*filter_dims=*/{2, 1, 1, 1, 1},  // DRSCK
+                 /*filter=*/{1, 1},
+                 /*strides=*/{1, 1, 1, 1, 1},
+                 /*padding=*/"VALID",
+                 /*data_format=*/"NCDHW",
+                 /*dilations=*/{1, 1, 1, 1, 1},
+                 /*is_conv3d_backprop_input=*/false,
+                 /*expected_output_dims=*/{1, 2, 3, 3},
+                 /*expected_output=*/
+                 {2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 7}},
+      // SAME padding (Asymmetric)
+      TestParams{
+          /*input_dims=*/{1, 2, 3, 2},  // CDHW
+          /*input=*/{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+          /*filter_dims=*/{2, 1, 1, 1, 1},  // DRSCK
+          /*filter=*/{-1, 1},
+          /*strides=*/{1, 1, 1, 1, 1},
+          /*padding=*/"SAME",
+          /*data_format=*/"NCDHW",
+          /*dilations=*/{1, 1, 1, 1, 1},
+          /*is_conv3d_backprop_input=*/false,
+          /*expected_output_dims=*/{1, 2, 3, 2},
+          /*expected_output=*/
+          {6, 6, 6, 6, 6, 6, -6, -7, -8, -9, -10,
+           -11}  // Diff in first 2 depths is const 6
+      },
+      // SAME padding (Symmetric)
+      TestParams{
+          /*input_dims=*/{1, 2, 3, 2},  // CDHW
+          /*input=*/{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+          /*filter_dims=*/{3, 1, 1, 1, 1},  // DRSCK
+          /*filter=*/{-1, 0, 1},
+          /*strides=*/{1, 1, 1, 1, 1},
+          /*padding=*/"SAME",
+          /*data_format=*/"NCDHW",
+          /*dilations=*/{1, 1, 1, 1, 1},
+          /*is_conv3d_backprop_input=*/false,
+          /*expected_output_dims=*/{1, 2, 3, 2},
+          /*expected_output=*/
+          {6, 7, 8, 9, 10, 11, 0, -1, -2, -3, -4,
+           -5}  // Swaps front two depths, negates
+      },
+
+      // NDHWC (multi-channel)
+      TestParams{
+          /*input_dims=*/{2, 3, 2, 2},  // DHWC
+          /*input=*/{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+          /*filter_dims=*/{2, 1, 1, 2, 1},  // DRSCK
+          /*filter=*/{-1, 1, 1, -1},
+          /*strides=*/{1, 1, 1, 1, 1},
+          /*padding=*/"VALID",
+          /*data_format=*/"NDHWC",
+          /*dilations=*/{1, 1, 1, 1, 1},
+          /*is_conv3d_backprop_input=*/false,
+          /*expected_output_dims=*/{1, 3, 2, 1},
+          /*expected_output=*/{0, 0, 0, 0, 0, 0}  // Each filter opposes the
+                                                  // other
+      },
+
+      // Dilated
+      TestParams{
+          /*input_dims=*/{1, 3, 3, 3},  // CDHW
+          /*input=*/{1,   1,   1,   1,   1, 1, 1, 1, 1, -10, -10, -10, -10, -10,
+                     -10, -10, -10, -10, 7, 7, 7, 7, 7, 7,   7,   7,   7},
+          /*filter_dims=*/{2, 1, 1, 1, 1},  // DRSCK
+          /*filter=*/{1, 1},
+          /*strides=*/{1, 1, 1, 1, 1},
+          /*padding=*/"VALID",
+          /*data_format=*/"NCDHW",
+          /*dilations=*/{1, 1, 2, 1, 1},
+          /*is_conv3d_backprop_input=*/false,
+          /*expected_output_dims=*/{1, 1, 3, 3},
+          /*expected_output=*/{8, 8, 8, 8, 8, 8, 8, 8, 8}  // Only front depth
+                                                           // is valid, skips
+                                                           // neg values
+      },
+      // Strided
+      TestParams{
+          /*input_dims=*/{1, 3, 3, 3},
+          /*input=*/{1, 0, 2, 0, 0, 0, 3, 0, 4, 0, 0, 0, 0, 0,
+                     0, 0, 0, 0, 5, 0, 6, 0, 0, 0, 7, 0, 8},
+          /*filter_dims=*/{1, 1, 1, 1, 1},
+          /*filter=*/{1},
+          /*strides=*/{1, 1, 2, 2, 2},
+          /*padding=*/"VALID",
+          /*data_format=*/"NCDHW",
+          /*dilations=*/{1, 1, 1, 1, 1},
+          /*is_conv3d_backprop_input=*/false,
+          /*expected_output_dims=*/{1, 2, 2, 2},
+          /*expected_output=*/{1, 2, 3, 4, 5, 6, 7, 8}  // Should only pick up
+                                                        // the corners
+      },
+      // Transpose Strided
+      TestParams{/*input_dims=*/{1, 2, 2, 2},  // CDHW
+                 /*input=*/{1, 2, 3, 4, 5, 6, 7, 8},
+                 /*filter_dims=*/{1, 1, 1, 1, 1},
+                 /*filter=*/{1},
+                 /*strides=*/{1, 1, 2, 2, 2},
+                 /*padding=*/"VALID",
+                 /*data_format=*/"NCDHW",
+                 /*dilations=*/{1, 1, 1, 1, 1},
+                 /*is_conv3d_backprop_input=*/true,
+                 /*expected_output_dims=*/{1, 3, 3, 3},
+                 /*expected_output=*/
+                 {1, 0, 2, 0, 0, 0, 3, 0, 4, 0, 0, 0, 0, 0,
+                  0, 0, 0, 0, 5, 0, 6, 0, 0, 0, 7, 0, 8}},  // Cube
+                                                            // expands and
+                                                            // fills
+                                                            // center with
+                                                            // zeroes
+
+  };
+
+  for (int i = 0; i < kConv3DOKCases; i++) {
+    Reset();
+    NodeDef node_def = get_conv3d_nodedef(
+        ok_params[i].strides, ok_params[i].padding, ok_params[i].data_format,
+        ok_params[i].dilations, ok_params[i].is_conv3d_backprop_input);
+    AddTestTensor("input", ok_params[i].input_dims);
+    AddTestWeights<float>("weights", ok_params[i].filter_dims,
+                          ok_params[i].filter);
+    if (ok_params[i].is_conv3d_backprop_input) {
+      AddTestWeights<float>(
+          "input_sizes",
+          {static_cast<int>(ok_params[i].expected_output.size())},
+          ok_params[i].expected_output);
+    }
+    RunValidationAndConversion(node_def);
+    TRT_TensorOrWeights output;
+    TF_EXPECT_OK(GetTensorOrWeights("my_conv3d", &output));
+    ASSERT_TRUE(output.is_tensor());
+    ExpectTrtDimsEqualsArray(ok_params[i].expected_output_dims,
+                             output.tensor()->getDimensions());
+
+    const DataVec input_data{
+        {"input", test::AsTensor<float>(ok_params[i].input)}};
+    DataVec output_data{
+        {"my_conv3d",
+         ConstructTensor<float>(ok_params[i].expected_output.size())}};
+    BuildAndRun(input_data, &output_data);
+    EXPECT_THAT(GetSpanForData<float>(output_data[0]),
+                ElementsAreArray(ok_params[i].expected_output));
+  }
+}
+#endif  // IS_TRT_VERSION_GE(6, 0, 0, 0)
 
 TEST_F(OpConverterTest, ConvertTopK) {
   // TODO(tmorris): This test isn't setting the input dtype properly. TopK with
@@ -5708,6 +6188,111 @@ TEST_F(OpConverterTest, ConvertResize) {
   TestConvertResize<ops::ResizeNearestNeighbor, DT_HALF>(this);
 }
 #endif  // IS_TRT_VERSION_GE(6, 0, 0, 0)
+
+NodeDef MakePadNodeDef(std::string name, DataType dtype) {
+  Scope s = Scope::NewRootScope();
+  auto input = ops::Placeholder(s.WithOpName("input"), dtype);
+  auto padding = ops::Placeholder(s.WithOpName("padding"), DT_INT32);
+  auto pad = ops::Pad(s.WithOpName(name), input, padding);
+  return pad.operation.node()->def();
+}
+
+template <typename CType>
+struct PadTestParams {
+  std::vector<int> input_dims;
+  std::vector<int> pad_dims;
+  std::vector<CType> input_values;
+  std::vector<int> expected_output_dims;
+  std::vector<CType> expected_output_values;
+};
+
+template <DataType dtype>
+void TestConvertPad(OpConverterTest* test) {
+  typedef typename EnumToDataType<dtype>::Type CType;
+
+  std::vector<PadTestParams<CType>> params{
+      {
+          /*input_dims=*/{1, 2, 1},  // H, W, C
+          /*pad_dims=*/{4, 2},       // #dims, {pad_before, pad_after}
+          /*input_values=*/CastTestVector<float, CType>({2.0f, -1.0f}),
+          /*expected_output_dims=*/{2, 3, 1},  // H, W, C
+          /*expected_output_values=*/
+          CastTestVector<float, CType>({0.0, 0.0, 0.0, 2.0f, -1.0f, 0.0}),
+      },
+  };
+
+  for (int i = 0; i < params.size(); ++i) {
+    test->Reset();
+    // Create pad node.
+    NodeDef node_def = MakePadNodeDef("my_pad", dtype);
+    // Create input tensor
+    test->AddTestTensor("input", params[i].input_dims, /*batch_size=*/1,
+                        /*trt_dtype=*/TfDataTypeToTrt(dtype));
+    // Create output size.
+    test->AddTestWeights<int32>("padding", params[i].pad_dims,
+                                {0, 0, 1, 0, 0, 1, 0, 0});
+    test->RunValidationAndConversion(node_def);
+
+    TRT_TensorOrWeights output;
+    TF_EXPECT_OK(test->GetTensorOrWeights("padding", &output));
+
+    // Create input data for tensors.
+    const DataVec input_data{
+        {"input", test::AsTensor<CType>(params[i].input_values)}};
+    DataVec output_data{
+        {"my_pad",
+         ConstructTensor<CType>(params[i].expected_output_values.size())}};
+
+    test->BuildAndRun(
+        input_data, &output_data,
+        dtype == DT_HALF ? TrtPrecisionMode::FP16 : TrtPrecisionMode::FP32);
+    ExpectArrayAlmostEqual(params[i].expected_output_values,
+                           GetSpanForData<CType>(output_data[0]), CType(1e-5));
+  }
+}
+
+TEST_F(OpConverterTest, ConvertPad) {
+  {
+    // First input is weight, should fail.
+    Reset();
+    NodeDef node_def = MakePadNodeDef("my_pad", DT_FLOAT);
+    AddTestWeights<float>("input", {1, 2}, {1, 2});
+    AddTestWeights<int>("padding", {1, 2}, {1, 2});
+    RunValidationAndConversion(node_def, error::UNIMPLEMENTED,
+                               "The input \"tensor\" for Pad must be a "
+                               "tensor");
+  }
+  {
+    // padding is a tensor, should fail.
+    Reset();
+    NodeDef node_def = MakePadNodeDef("my_pad", DT_FLOAT);
+    AddTestTensor("input", {1, 2});
+    AddTestTensor("padding", {1, 2});
+    RunValidationAndConversion(node_def, error::UNIMPLEMENTED,
+                               "The input \"paddings\" for Pad must be a "
+                               "constant");
+  }
+  TestConvertPad<DT_FLOAT>(this);
+  TestConvertPad<DT_HALF>(this);
+  {
+    // Make sure that ranges are inferred across a Pad.
+    Reset();
+    NodeDef node_def = MakePadNodeDef("my_pad", DT_FLOAT);
+    AddTestTensor("input", {1, 2, 1});
+    AddTestWeights<int>("padding", {4, 2}, {0, 0, 1, 0, 0, 1, 0, 0});
+    TRT_TensorOrWeights input;
+    TRT_TensorOrWeights output;
+    RunValidationAndConversion(node_def);
+    TF_EXPECT_OK(GetTensorOrWeights("input", &input));
+    TF_EXPECT_OK(GetTensorOrWeights("my_pad", &output));
+    converter_->ProvideQuantizationRange(input.tensor(), -5.0f, 5.0f);
+    // Input range should be inferred across pad.
+    PropagateQuantizationRanges();
+    auto ranges = quantization_ranges();
+    EXPECT_EQ(5.0f, ranges[input.tensor()]);
+    EXPECT_EQ(5.0f, ranges[output.tensor()]);
+  }
+}
 
 }  // namespace convert
 }  // namespace tensorrt

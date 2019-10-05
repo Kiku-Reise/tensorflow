@@ -58,17 +58,17 @@ class XlaInterpreterExecutor : public internal::StreamExecutorInterface {
     return port::Status::OK();
   }
 
-  bool GetKernel(const MultiKernelLoaderSpec &spec,
-                 KernelBase *kernel) override {
-    return false;
+  port::Status GetKernel(const MultiKernelLoaderSpec &spec,
+                         KernelBase *kernel) override {
+    return port::UnimplementedError("Not Implemented");
   }
-  bool Launch(Stream *stream, const ThreadDim &thread_dims,
-              const BlockDim &block_dims, const KernelBase &kernel,
-              const KernelArgsArrayBase &args) override {
-    return false;
+  port::Status Launch(Stream *stream, const ThreadDim &thread_dims,
+                      const BlockDim &block_dims, const KernelBase &kernel,
+                      const KernelArgsArrayBase &args) override {
+    return port::UnimplementedError("Not Implemented");
   }
 
-  void *Allocate(uint64 size) override;
+  DeviceMemoryBase Allocate(uint64 size, int64 memory_space) override;
   void *GetSubBuffer(DeviceMemoryBase *parent, uint64 offset_bytes,
                      uint64 size_bytes) override;
   void Deallocate(DeviceMemoryBase *mem) override;
@@ -105,13 +105,14 @@ class XlaInterpreterExecutor : public internal::StreamExecutorInterface {
 
   // No "synchronize all activity" implemented for this platform at the moment.
   bool SynchronizeAllActivity() override { return true; }
-  bool SynchronousMemZero(DeviceMemoryBase *location, uint64 size) override {
-    return false;
+  port::Status SynchronousMemZero(DeviceMemoryBase *location,
+                                  uint64 size) override {
+    return port::InternalError("Interpreter can not memzero");
   }
 
-  bool SynchronousMemSet(DeviceMemoryBase *location, int value,
-                         uint64 size) override {
-    return false;
+  port::Status SynchronousMemSet(DeviceMemoryBase *location, int value,
+                                 uint64 size) override {
+    return port::InternalError("Interpreter can not memset");
   }
 
   port::Status SynchronousMemcpy(DeviceMemoryBase *dev_dst,

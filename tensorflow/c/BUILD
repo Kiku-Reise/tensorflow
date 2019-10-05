@@ -25,6 +25,7 @@ filegroup(
         "c_api_experimental.h",
         "tf_attrtype.h",
         "tf_datatype.h",
+        "tf_file_statistics.h",
         "tf_status.h",
         "tf_tensor.h",
     ],
@@ -46,7 +47,7 @@ filegroup(
             "*test*",
         ],
     ) + [
-        "//tensorflow/cc:srcs",
+        "//tensorflow/cc:srcs_no_runtime",
         "//tensorflow/core/distributed_runtime:server_lib.h",
     ],
     visibility = ["//visibility:public"],
@@ -73,7 +74,7 @@ tf_cuda_library(
             "//tensorflow/core:core_cpu",
             "//tensorflow/core:framework",
             "//tensorflow/core:lib",
-            "//tensorflow/core:lib_platform",
+            "//tensorflow/core/platform:platform",
             "//tensorflow/core:op_gen_lib",
             "//tensorflow/core/distributed_runtime:server_lib",
         ],
@@ -95,6 +96,7 @@ tf_cuda_library(
         "c_api.h",
         "tf_attrtype.h",
         "tf_datatype.h",
+        "tf_file_statistics.h",
         "tf_status.h",
         "tf_tensor.h",
     ],
@@ -105,6 +107,7 @@ tf_cuda_library(
         ":c_api_internal",
         ":tf_attrtype",
         ":tf_status_internal",
+        ":tf_file_statistics",
     ] + select({
         "//tensorflow:with_xla_support": [
             "//tensorflow/compiler/tf2xla:xla_compiler",
@@ -190,6 +193,12 @@ cc_library(
 )
 
 cc_library(
+    name = "tf_file_statistics",
+    hdrs = ["tf_file_statistics.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "tf_datatype",
     srcs = ["tf_datatype.cc"],
     hdrs = ["tf_datatype.h"],
@@ -202,6 +211,7 @@ cc_library(
             "//tensorflow/core:framework",
         ],
     }),
+    alwayslink = 1,
 )
 
 cc_library(
@@ -263,12 +273,13 @@ tf_cuda_library(
         "//tensorflow/core:core_cpu",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
-        "//tensorflow/core:lib_platform",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/common_runtime/eager:attr_builder",
         "//tensorflow/core/distributed_runtime/rpc:grpc_server_lib",
+        "//tensorflow/core/platform",
         "@com_google_absl//absl/strings",
     ],
+    alwayslink = 1,
 )
 
 exports_files(
@@ -327,18 +338,18 @@ tf_cuda_library(
     visibility = ["//visibility:public"],
     deps = select({
         "//tensorflow:android": [
-            ":c_api",
-            ":tf_status_helper",
             "//tensorflow/core:android_tensorflow_lib_lite",
-            "//tensorflow/core:lib",
         ],
         "//conditions:default": [
-            ":c_api",
-            ":tf_status_helper",
             "//tensorflow/core:framework",
-            "//tensorflow/core:lib",
         ],
-    }) + [":c_api_internal"],
+    }) + [
+        ":c_api",
+        ":tf_status_helper",
+        ":c_api_internal",
+        ":tf_file_statistics",
+        "//tensorflow/core:lib",
+    ],
 )
 
 tf_cuda_library(
@@ -354,6 +365,7 @@ tf_cuda_library(
     deps = [
         ":tf_status",
         ":tf_status_helper",
+        ":tf_tensor_internal",
     ] + select({
         "//tensorflow:android": [
             ":c_api_internal",
@@ -363,6 +375,7 @@ tf_cuda_library(
             ":c_api_internal",
             ":tf_tensor",
             "//tensorflow/core:framework",
+            "//tensorflow/core:framework_lite",
         ],
     }),
 )
@@ -389,6 +402,7 @@ tf_cuda_library(
             "//tensorflow/core:framework",
         ],
     }),
+    alwayslink = 1,
 )
 
 # -----------------------------------------------------------------------------
@@ -464,7 +478,6 @@ tf_cuda_cc_test(
         "//tensorflow/core:math_ops_op_lib",
         "//tensorflow/core:nn_ops_op_lib",
         "//tensorflow/core:no_op_op_lib",
-        "//tensorflow/core:proto_text",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core:sendrecv_ops_op_lib",
         "//tensorflow/core:spectral_ops_op_lib",
@@ -500,6 +513,7 @@ tf_cc_test(
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+        "@com_google_absl//absl/types:optional",
     ],
 )
 
@@ -576,7 +590,7 @@ tf_cuda_cc_test(
         "//tensorflow:macos": ["-headerpad_max_install_names"],
         "//conditions:default": [],
     }),
-    tags = ["noasan"],
+    tags = ["no_cuda_on_cpu_tap"],
     # We must ensure that the dependencies can be dynamically linked since
     # the shared library must be able to use core:framework.
     # linkstatic = tf_kernel_tests_linkstatic(),
@@ -585,10 +599,11 @@ tf_cuda_cc_test(
         ":kernels",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
-        "//tensorflow/core:proto_text",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+        "//tensorflow/core/kernels:ops_testutil",
+        "//third_party/eigen3",
     ],
 )
 

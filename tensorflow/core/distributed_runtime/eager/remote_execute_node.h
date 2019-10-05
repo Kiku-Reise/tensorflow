@@ -16,9 +16,17 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_EAGER_REMOTE_EXECUTE_NODE_H_
 #define TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_EAGER_REMOTE_EXECUTE_NODE_H_
 
+#include <cstddef>
+
+#include "absl/types/span.h"
+#include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/eager/eager_executor.h"
+#include "tensorflow/core/common_runtime/eager/shape_inference.h"
 #include "tensorflow/core/common_runtime/eager/tensor_handle.h"
 #include "tensorflow/core/distributed_runtime/eager/eager_client.h"
+#include "tensorflow/core/framework/function.h"
+#include "tensorflow/core/framework/node_def.pb.h"
+#include "tensorflow/core/lib/gtl/inlined_vector.h"
 #include "tensorflow/core/protobuf/eager_service.pb.h"
 
 namespace tensorflow {
@@ -26,77 +34,69 @@ namespace eager {
 
 // RemoteExecuteNode is an implementation of EagerNode which enqueues
 // an operation via RPC in a remote EagerService.
-class RemoteExecuteNode : public tensorflow::EagerNode {
+class RemoteExecuteNode : public AsyncEagerNode {
  public:
-  RemoteExecuteNode(tensorflow::uint64 node_id,
-                    std::unique_ptr<EnqueueRequest> request,
-                    EagerClient* eager_client,
+  RemoteExecuteNode(std::unique_ptr<EnqueueRequest> request, Device* device,
+                    EagerClient* eager_client, const NodeDef& ndef,
+                    FunctionLibraryDefinition* lib_def,
                     const gtl::InlinedVector<TensorHandle*, 4>& inputs,
-                    TensorHandle** retvals, int num_retvals)
-      : tensorflow::EagerNode(node_id),
+                    absl::Span<TensorHandle*> retvals)
+      : AsyncEagerNode(),
         request_(std::move(request)),
+        device_(device),
         eager_client_(eager_client),
+        ndef_(ndef),
+        lib_def_(lib_def),
         inputs_(inputs) {
     // Copy the output handles, since the container for them might get
     // destroyed.
-    for (int i = 0; i < num_retvals; i++) {
-      retvals_.push_back(retvals[i]);
-      retvals_[i]->Ref();
+    for (auto handle : retvals) {
+      handle->Ref();
+      retvals_.push_back(handle);
     }
 
     // This is required to ensure that the tensor handles stay alive across the
     // execution.
-    for (auto* handle : inputs_) {
+    for (auto handle : inputs_) {
       handle->Ref();
     }
   }
 
-  Status Run() override {
-    EnqueueResponse response;
-    Status status;
-    Notification n;
-    eager_client_->EnqueueAsync(request_.get(), &response,
-                                [&n, &status](const Status& s) {
-                                  status.Update(s);
-                                  n.Notify();
-                                });
-    n.WaitForNotification();
-
-    if (!status.ok()) {
-      Abort(status);
-      return status;
-    }
-
-    for (int i = 0; i < retvals_.size(); i++) {
-      Status s =
-          retvals_[i]->SetRemoteShape(response.queue_response(0).shape(i));
-      if (!s.ok()) {
-        retvals_[i]->Poison(s);
-      }
-      retvals_[i]->Unref();
-    }
-
-    for (auto* handle : inputs_) {
+  ~RemoteExecuteNode() override {
+    for (auto handle : retvals_) {
       handle->Unref();
     }
 
-    return status;
+    for (auto handle : inputs_) {
+      handle->Unref();
+    }
   }
 
-  void Abort(Status status) override {
-    for (int i = 0; i < retvals_.size(); i++) {
-      retvals_[i]->Poison(status);
-      retvals_[i]->Unref();
-    }
+  Status Prepare() override {
+    return RunShapeInference(ndef_, *lib_def_, inputs_, retvals_);
+  }
 
-    for (auto* handle : inputs_) {
-      handle->Unref();
+  void RunAsync(StatusCallback done) override;
+
+  void Abort(Status status) override {
+    for (auto handle : retvals_) {
+      handle->Poison(status);
     }
+  }
+
+  string DebugString() const override {
+    string out = "[RemoteExecuteNode]";
+    strings::StrAppend(&out, " request: ", request_->DebugString());
+    strings::StrAppend(&out, ", target_device: ", device_->name());
+    return out;
   }
 
  private:
   std::unique_ptr<EnqueueRequest> request_;
+  Device* device_;             // Not owned
   EagerClient* eager_client_;  // Not owned, and must outlive this node.
+  const NodeDef ndef_;
+  const FunctionLibraryDefinition* lib_def_;
   gtl::InlinedVector<TensorHandle*, 4> inputs_;
   gtl::InlinedVector<TensorHandle*, 2> retvals_;
 };
